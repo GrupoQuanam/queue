@@ -227,6 +227,53 @@ class GQJob(models.Model):
     # ── Runner principal ──────────────────────────────────────────────────────
 
     @api.model
+    def _gq_recover_started_jobs(self):
+        """Resetea jobs huérfanos en estado 'started' tras un crash del servidor.
+
+        Un job en 'started' que puede ser bloqueado con SKIP LOCKED no tiene
+        ningún worker activo procesándolo → es huérfano. Se reinicia a 'pending'
+        (o 'failed' si superó max_retries).
+        """
+        self.env.flush_all()
+        self.env.cr.execute(
+            """
+            UPDATE gq_job
+            SET
+                state = CASE
+                    WHEN max_retries != 0 AND retry_count >= max_retries
+                    THEN 'failed'
+                    ELSE 'pending'
+                END,
+                retry_count = retry_count + 1,
+                exc_info = CASE
+                    WHEN max_retries != 0 AND retry_count >= max_retries
+                    THEN 'Job encontrado muerto: servidor reiniciado durante su ejecución'
+                    ELSE exc_info
+                END,
+                date_done = CASE
+                    WHEN max_retries != 0 AND retry_count >= max_retries
+                    THEN (now() AT TIME ZONE 'UTC')
+                    ELSE date_done
+                END
+            WHERE state = 'started'
+              AND id IN (
+                  SELECT id FROM gq_job
+                  WHERE state = 'started'
+                  FOR NO KEY UPDATE SKIP LOCKED
+              )
+            RETURNING id
+            """
+        )
+        rows = self.env.cr.fetchall()
+        if rows:
+            ids = [r[0] for r in rows]
+            _logger.warning(
+                "GQ Queue: %d job(s) huérfano(s) recuperado(s) tras reinicio: %s",
+                len(ids),
+                ids,
+            )
+
+    @api.model
     def _gq_acquire_one_job(self):
         """Toma el siguiente job pendiente y lo bloquea para evitar procesamiento duplicado.
 
@@ -257,6 +304,7 @@ class GQJob(models.Model):
         El loop continua hasta que no queden jobs pendientes.
         """
         _logger.debug("GQ Job Runner started")
+        self._gq_recover_started_jobs()
         job = self._gq_acquire_one_job()
         processed = 0
         while job:
