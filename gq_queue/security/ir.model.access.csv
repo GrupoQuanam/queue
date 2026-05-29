@@ -1,0 +1,3 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+access_gq_job_user,gq.job user,model_gq_job,base.group_user,1,0,0,0
+access_gq_job_manager,gq.job manager,model_gq_job,base.group_system,1,1,1,1

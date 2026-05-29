@@ -1,0 +1,139 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <!-- ── List view ──────────────────────────────────────────────────────── -->
+
+    <record id="gq_job_view_tree" model="ir.ui.view">
+        <field name="name">gq.job.tree</field>
+        <field name="model">gq.job</field>
+        <field name="arch" type="xml">
+            <tree decoration-danger="state == 'failed'"
+                  decoration-muted="state == 'cancelled'"
+                  decoration-success="state == 'done'"
+                  decoration-warning="state == 'started'">
+                <field name="name"/>
+                <field name="model_name"/>
+                <field name="method_name"/>
+                <field name="state"/>
+                <field name="priority"/>
+                <field name="channel"/>
+                <field name="eta"/>
+                <field name="retry_count"/>
+                <field name="date_created"/>
+                <field name="date_done"/>
+            </tree>
+        </field>
+    </record>
+
+    <!-- ── Form view ──────────────────────────────────────────────────────── -->
+
+    <record id="gq_job_view_form" model="ir.ui.view">
+        <field name="name">gq.job.form</field>
+        <field name="model">gq.job</field>
+        <field name="arch" type="xml">
+            <form>
+                <header>
+                    <field name="state" widget="statusbar"
+                           statusbar_visible="pending,started,done,failed"/>
+                </header>
+                <sheet>
+                    <group>
+                        <group string="Job">
+                            <field name="name"/>
+                            <field name="uuid"/>
+                            <field name="channel"/>
+                            <field name="priority"/>
+                        </group>
+                        <group string="Execution">
+                            <field name="model_name"/>
+                            <field name="method_name"/>
+                            <field name="eta"/>
+                            <field name="max_retries"/>
+                            <field name="retry_count"/>
+                        </group>
+                    </group>
+                    <notebook>
+                        <page string="Arguments">
+                            <group>
+                                <field name="record_ids"/>
+                                <field name="args"/>
+                                <field name="kwargs"/>
+                            </group>
+                        </page>
+                        <page string="Result">
+                            <group>
+                                <field name="result"/>
+                            </group>
+                            <group>
+                                <field name="exc_info" widget="text"/>
+                            </group>
+                        </page>
+                        <page string="Dates">
+                            <group>
+                                <field name="date_created"/>
+                                <field name="date_started"/>
+                                <field name="date_done"/>
+                            </group>
+                        </page>
+                    </notebook>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <!-- ── Search view ────────────────────────────────────────────────────── -->
+
+    <record id="gq_job_view_search" model="ir.ui.view">
+        <field name="name">gq.job.search</field>
+        <field name="model">gq.job</field>
+        <field name="arch" type="xml">
+            <search>
+                <field name="name"/>
+                <field name="model_name"/>
+                <field name="method_name"/>
+                <filter name="pending" string="Pending"
+                        domain="[('state','=','pending')]"/>
+                <filter name="started" string="Running"
+                        domain="[('state','=','started')]"/>
+                <filter name="failed" string="Failed"
+                        domain="[('state','=','failed')]"/>
+                <filter name="done" string="Done"
+                        domain="[('state','=','done')]"/>
+                <separator/>
+                <group expand="0" string="Group By">
+                    <filter name="group_state" string="State"
+                            context="{'group_by': 'state'}"/>
+                    <filter name="group_model" string="Model"
+                            context="{'group_by': 'model_name'}"/>
+                    <filter name="group_channel" string="Channel"
+                            context="{'group_by': 'channel'}"/>
+                </group>
+            </search>
+        </field>
+    </record>
+
+    <!-- ── Action ─────────────────────────────────────────────────────────── -->
+
+    <record id="gq_job_action" model="ir.actions.act_window">
+        <field name="name">GQ Queue Jobs</field>
+        <field name="res_model">gq.job</field>
+        <field name="view_mode">tree,form</field>
+        <field name="search_view_id" ref="gq_job_view_search"/>
+        <field name="context">{'search_default_pending': 1}</field>
+    </record>
+
+    <!-- ── Menu ───────────────────────────────────────────────────────────── -->
+
+    <menuitem
+        id="gq_queue_menu_root"
+        name="GQ Queue"
+        sequence="100"/>
+
+    <menuitem
+        id="gq_queue_menu_jobs"
+        name="Jobs"
+        parent="gq_queue_menu_root"
+        action="gq_job_action"
+        sequence="10"/>
+
+</odoo>

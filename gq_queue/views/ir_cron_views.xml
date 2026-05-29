@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <record id="gq_ir_cron_view_form" model="ir.ui.view">
+        <field name="name">ir.cron.gq.form</field>
+        <field name="model">ir.cron</field>
+        <field name="inherit_id" ref="base.ir_cron_view_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//field[@name='doall']" position="after">
+                <field name="gq_job_runner" attrs="{'invisible': [('model_name', '!=', 'gq.job')]}"/>
+            </xpath>
+        </field>
+    </record>
+
+</odoo>

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo noupdate="1">
+
+    <!--
+        Runner principal del GQ Queue.
+
+        El intervalo (1 dia) es solo un fallback; en la practica el cron
+        se dispara automaticamente via ir.cron._trigger() cada vez que se
+        crea o modifica un gq.job en estado pending.
+
+        Para ejecucion paralela: duplicar este registro tantas veces como
+        CronWorkers se quieran dedicar, y asegurarse de que
+        max-cron-threads >= N en la configuracion de Odoo.
+    -->
+    <record id="gq_job_cron" model="ir.cron">
+        <field name="name">GQ Queue Job Runner</field>
+        <field name="model_id" ref="gq_queue.model_gq_job"/>
+        <field name="state">code</field>
+        <field name="code">model._gq_job_runner()</field>
+        <field name="gq_job_runner" eval="True"/>
+        <field name="user_id" ref="base.user_root"/>
+        <field name="interval_number">1</field>
+        <field name="interval_type">days</field>
+        <field name="numbercall">-1</field>
+        <field name="active" eval="True"/>
+    </record>
+
+</odoo>
