@@ -297,19 +297,28 @@ class GQJob(models.Model):
         return self.browse(row and row[0])
 
     @api.model
-    def _gq_job_runner(self, commit=True):
+    def _gq_job_runner(self, commit=True, max_seconds=840):
         """Punto de entrada del cron: procesa todos los jobs pendientes disponibles.
 
         Llamado por el ir.cron con gq_job_runner=True.
-        El loop continua hasta que no queden jobs pendientes.
+        El loop continua hasta que no queden jobs pendientes o se alcance max_seconds.
+        Si se alcanza el deadline, re-dispara el cron para continuar en la siguiente
+        ejecución y evitar que el servidor mate el proceso.
         """
-        _logger.debug("GQ Job Runner started")
+        deadline = fields.Datetime.now() + timedelta(seconds=max_seconds)
+        _logger.debug("GQ Job Runner started (deadline en %ds)", max_seconds)
         self._gq_recover_started_jobs()
         job = self._gq_acquire_one_job()
         processed = 0
         while job:
             job._gq_process(commit=commit)
             processed += 1
+            if fields.Datetime.now() >= deadline:
+                _logger.info(
+                    "GQ Runner: deadline alcanzado (%ds), re-disparando cron", max_seconds
+                )
+                self._gq_cron_trigger()
+                break
             job = self._gq_acquire_one_job()
         _logger.debug("GQ Job Runner finished (%d jobs processed)", processed)
 
