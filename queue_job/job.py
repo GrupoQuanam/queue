@@ -13,8 +13,29 @@ from datetime import datetime, timedelta
 from random import randint
 
 import odoo
+from odoo.models import BaseModel
 
 from .exception import FailedJobError, NoSuchJobError, RetryableJobError
+
+
+def _rebind_to_cr(value, cr):
+    """Rebind any BaseModel inside ``value`` to the cursor ``cr``.
+
+    Recurses into lists, tuples and dicts. Preserves uid/su/context of each
+    inner env - only the cursor is swapped. Recordsets already bound to
+    ``cr`` and non-recordset values pass through untouched. Containers are
+    rebuilt, so in-place changes to the result are lost.
+    """
+    if isinstance(value, BaseModel):
+        if value.env.cr is cr:
+            return value
+        return value.with_env(value.env(cr=cr))
+    if isinstance(value, list | tuple):
+        return type(value)(_rebind_to_cr(v, cr) for v in value)
+    if isinstance(value, dict):
+        return {k: _rebind_to_cr(v, cr) for k, v in value.items()}
+    return value
+
 
 WAIT_DEPENDENCIES = "wait_dependencies"
 PENDING = "pending"
@@ -409,6 +430,12 @@ class Job:
         self.job_config = (
             self.env["queue.job.function"].sudo().job_config(self.job_function_name)
         )
+        on_fail_method_name = self.job_config.on_fail_method_name
+        if on_fail_method_name and not _is_model_method(
+            getattr(self.recordset, on_fail_method_name, None)
+        ):
+            raise TypeError("Job accepts only methods of Models")
+        self.on_fail_method_name = on_fail_method_name
 
         self.state = PENDING
 
@@ -512,8 +539,8 @@ class Job:
     def in_temporary_env(self):
         with self.env.registry.cursor() as new_cr:
             env = self.env
-            self._env = env(cr=new_cr)
             try:
+                self._env = env(cr=new_cr)
                 yield
             finally:
                 self._env = env
@@ -688,6 +715,24 @@ class Job:
         self.recordset = self.recordset.with_env(env)
 
     @property
+    def args(self):
+        """Positional arguments, rebound to the job's current cursor."""
+        return _rebind_to_cr(self._args, self.env.cr)
+
+    @args.setter
+    def args(self, value):
+        self._args = value
+
+    @property
+    def kwargs(self):
+        """Keyword arguments, rebound to the job's current cursor."""
+        return _rebind_to_cr(self._kwargs, self.env.cr)
+
+    @kwargs.setter
+    def kwargs(self, value):
+        self._kwargs = value
+
+    @property
     def func(self):
         recordset = self.recordset.with_context(job_uuid=self.uuid)
         return getattr(recordset, self.method_name)
@@ -828,6 +873,13 @@ class Job:
         for k, v in kw.items():
             if v is not None:
                 setattr(self, k, v)
+
+    def on_fail(self, fail_vals):
+        if not self.on_fail_method_name:
+            return
+        on_fail_func = getattr(self.recordset, self.on_fail_method_name, None)
+        if on_fail_func:
+            on_fail_func(**fail_vals)
 
     def __repr__(self):
         return "<Job %s, priority:%d>" % (self.uuid, self.priority)
