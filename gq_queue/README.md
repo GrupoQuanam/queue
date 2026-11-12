@@ -130,6 +130,7 @@ Tabla PostgreSQL: `gq_job`
 | `max_retries` | Integer | Máximo de reintentos en error retryable. `0` = sin límite. Default: `5` |
 | `retry_count` | Integer | Número de intentos iniciados (se cuenta al pasar a `started`) |
 | `channel` | Char | Canal lógico (informativo). Default: `"root"` |
+| `identity_key` | Char | Clave de identidad: mientras haya un job pendiente con esta clave no se encola otro |
 | `result` | Text | Mensaje de resultado (éxito o descripción del reintento) |
 | `exc_info` | Text | Traceback completo en caso de fallo |
 | `date_created` | Datetime | Fecha de creación del job |
@@ -221,6 +222,34 @@ self.env["my.model"].with_gq_delay().some_model_method(param)
 | `description` | str | Auto | Descripción del job visible en la UI. |
 | `max_retries` | int | `5` | Reintentos máximos ante `GQRetryableJobError`. `0` = sin límite. |
 | `channel` | str | `"root"` | Canal lógico del job (informativo). |
+| `identity_key` | str | `None` | Si ya hay un job **pendiente** con esta clave, no se encola otro y se retorna el existente. |
+| `chunk_size` | int | `None` | Divide el recordset en lotes de este tamaño y encola un job por lote. |
+
+`identity_key` y `chunk_size` no se pueden combinar.
+
+### Funciones encolables
+
+Se puede encolar cualquier función del modelo, pública o privada (`_mi_funcion`). Conviene encolar funciones privadas: las públicas son invocables por RPC. Si la función no existe en el modelo, `with_gq_delay()` lanza `AttributeError` al encolar.
+
+### Trabajos grandes: lotes
+
+Un job debe durar menos que el margen de tiempo del runner (ver sección 10). Para procesar muchos registros, dividir en lotes:
+
+```python
+# 5 000 facturas → 50 jobs de 100 registros cada uno
+invoices.with_gq_delay(chunk_size=100)._procesar()
+```
+
+Cada lote es un job independiente: se reintenta y falla por separado. La llamada retorna el recordset con todos los jobs creados.
+
+### Evitar duplicados: clave de identidad
+
+```python
+# Varios clics seguidos encolan un solo job
+self.with_gq_delay(identity_key=f"sync-partner-{self.id}")._sincronizar()
+```
+
+Solo cuentan los jobs en `pending`. Un job ya iniciado no bloquea la clave, porque puede haber leído datos anteriores al nuevo encolado.
 
 ---
 
@@ -343,7 +372,8 @@ Los errores de serialización de PostgreSQL (`OperationalError` con códigos en 
 
 ### Cómo se activa el runner
 
-El cron **no corre continuamente**. Se despierta a demanda:
+El cron se despierta a demanda. Su intervalo propio (10 minutos) es solo un respaldo
+por si se pierde un disparo; una corrida sin jobs cuesta dos consultas.
 
 ```
 Job creado (state=pending, eta=NULL)
@@ -492,6 +522,20 @@ max_cron_threads = 2
 # limit_time_real_cron = 900
 ```
 
+### Limpieza automática
+
+El autovacuum de Odoo borra los jobs `done` y `cancelled` con más de 30 días.
+Los `failed` se conservan para su revisión. Días configurables con el parámetro del
+sistema `gq_queue.keep_done_days` (`0` = no borrar).
+
+### Gestión desde la interfaz
+
+En **GQ Queue → Jobs** (solo `base.group_system`), desde el formulario o seleccionando
+varios en la lista:
+
+- **Requeue**: vuelve a `pending` un job `failed`, `cancelled` o `done` y reinicia sus intentos.
+- **Cancel**: cancela un job `pending` o `failed`. Un job `started` no se puede cancelar.
+
 ### Permisos
 
 - Encolar con `with_gq_delay()` no requiere permisos sobre `gq.job` (se crea con `sudo()`).
@@ -510,8 +554,9 @@ No se requieren variables de entorno adicionales.
 
 | Método | Descripción |
 |---|---|
-| `_gq_set_cancelled()` | Cancela un job manualmente (state → cancelled) |
-| `_gq_job_runner(commit=True)` | Entry point del cron. Procesa toda la cola. |
+| `action_requeue()` | Vuelve a encolar jobs terminados y reinicia sus intentos |
+| `action_cancel()` | Cancela jobs pendientes o fallidos |
+| `_gq_job_runner(commit=True, max_seconds=None)` | Entry point del cron. Procesa la cola dentro del presupuesto de tiempo. |
 | `_gq_cron_trigger(at=None)` | Dispara todos los crons `gq_job_runner`. |
 
 ### `GQDelayable` — `delay.py`
@@ -521,10 +566,11 @@ Clase proxy usada internamente por `with_gq_delay()`. También puede instanciars
 ```python
 from odoo.addons.gq_queue.delay import GQDelayable
 
-GQDelayable(recordset, priority=10, eta=None, description=None, max_retries=5, channel="root")
+GQDelayable(recordset, priority=10, eta=None, description=None, max_retries=5,
+            channel="root", identity_key=None, chunk_size=None)
 ```
 
-Al llamar cualquier método sobre el proxy, crea y retorna el `gq.job`:
+Al llamar cualquier función sobre el proxy, crea y retorna el `gq.job` (varios con `chunk_size`):
 
 ```python
 job = self.env["sale.order"].browse([1]).with_gq_delay().action_confirm()
@@ -553,6 +599,5 @@ raise GQNothingToDoJob("mensaje")
 | **Sin gestión de canales** | El campo `channel` es informativo. No hay control de capacidad por canal. |
 | **Job más largo que el margen** | Un job que dura más que la mitad del límite de tiempo del servidor puede ser interrumpido. Se reintenta como huérfano hasta agotar intentos. Dividirlo en jobs más chicos. |
 | **Sin `cr.commit()` en jobs** | El commit dentro de la función encolada suelta el bloqueo de la fila (ver sección 10, *Jobs huérfanos*). |
-| **Solo funciones públicas** | `with_gq_delay()` rechaza nombres que empiezan con `_`. |
 | **Recordsets no serializables** | No se pueden pasar recordsets como args/kwargs. Usar IDs. |
 | **Sin prioridad por canal** | La selección de jobs es global por `priority` + `date_created`, sin considerar canales. |

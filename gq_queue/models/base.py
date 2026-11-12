@@ -17,6 +17,8 @@ class Base(models.AbstractModel):
         description=None,
         max_retries=DEFAULT_MAX_RETRIES,
         channel="root",
+        identity_key=None,
+        chunk_size=None,
     ):
         """Encola una llamada a metodo como gq.job para ejecucion en background.
 
@@ -27,6 +29,10 @@ class Base(models.AbstractModel):
         :param description: Descripcion visible en la UI de GQ Queue.
         :param max_retries: Reintentos maximos ante GQRetryableJobError. 0 = sin limite.
         :param channel:     Canal logico (informativo). Default: 'root'.
+        :param identity_key: Si ya hay un job pendiente con esta clave, no se
+                            encola otro y se retorna el existente.
+        :param chunk_size:  Divide el recordset en lotes de este tamano y
+                            encola un job por lote.
         :returns: GQDelayable
 
         Ejemplo::
@@ -46,4 +52,6 @@ class Base(models.AbstractModel):
             description=description,
             max_retries=max_retries,
             channel=channel,
+            identity_key=identity_key,
+            chunk_size=chunk_size,
         )

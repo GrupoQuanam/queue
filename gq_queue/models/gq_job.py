@@ -7,6 +7,7 @@ from io import StringIO
 from psycopg2 import OperationalError
 
 from odoo import _, api, fields, models
+from odoo.exceptions import UserError
 from odoo.service.model import PG_CONCURRENCY_ERRORS_TO_RETRY
 from odoo.tools import config
 
@@ -22,6 +23,8 @@ PG_RETRY = 5
 DEFAULT_RUNNER_SECONDS = 600
 # Intentos permitidos a un job con max_retries = 0 cuyo worker muere al ejecutarlo
 ORPHAN_MAX_ATTEMPTS = 5
+# Dias que se conservan los jobs terminados (parametro gq_queue.keep_done_days)
+DEFAULT_KEEP_DONE_DAYS = 30
 
 GQ_PENDING = "pending"
 GQ_STARTED = "started"
@@ -139,6 +142,13 @@ class GQJob(models.Model):
         default="root",
         help="Canal logico del job. Actualmente informativo.",
     )
+    identity_key = fields.Char(
+        string="Identity Key",
+        readonly=True,
+        index=True,
+        copy=False,
+        help="Mientras haya un job pendiente con esta clave no se encola otro igual.",
+    )
 
     # ── Resultado ─────────────────────────────────────────────────────────────
 
@@ -155,6 +165,16 @@ class GQJob(models.Model):
     )
     date_started = fields.Datetime(string="Started At", readonly=True)
     date_done = fields.Datetime(string="Finished At", readonly=True)
+
+    def init(self):
+        # La cola se consulta por prioridad y antiguedad solo entre pendientes
+        self.env.cr.execute(
+            """
+            CREATE INDEX IF NOT EXISTS gq_job_pending_idx
+            ON gq_job (priority, date_created)
+            WHERE state = 'pending'
+            """
+        )
 
     # ── Maquina de estados ────────────────────────────────────────────────────
 
@@ -199,6 +219,38 @@ class GQJob(models.Model):
         if result is not None:
             vals["result"] = str(result)
         self.sudo().write(vals)
+
+    # ── Acciones de usuario ───────────────────────────────────────────────────
+
+    def action_requeue(self):
+        """Vuelve a encolar jobs terminados (fallidos, cancelados o hechos)."""
+        self.check_access("write")
+        if self.filtered(lambda job: job.state in (GQ_PENDING, GQ_STARTED)):
+            raise UserError(
+                _("Only failed, cancelled or done jobs can be requeued.")
+            )
+        self.sudo().write(
+            {
+                "state": GQ_PENDING,
+                "retry_count": 0,
+                "eta": False,
+                "result": False,
+                "exc_info": False,
+                "date_started": False,
+                "date_done": False,
+            }
+        )
+        return True
+
+    def action_cancel(self):
+        """Cancela jobs que no estan en ejecucion."""
+        self.check_access("write")
+        if self.filtered(lambda job: job.state == GQ_STARTED):
+            raise UserError(_("A running job cannot be cancelled."))
+        self.filtered(
+            lambda job: job.state in (GQ_PENDING, GQ_FAILED)
+        )._gq_set_cancelled()
+        return True
 
     # ── Ejecucion ─────────────────────────────────────────────────────────────
 
@@ -445,6 +497,10 @@ class GQJob(models.Model):
         while job:
             job._gq_process(commit=commit)
             processed += 1
+            # Registrar avance: un runner que muere tras procesar jobs no cuenta
+            # como fallo del cron. remaining=0 evita que el cron relance el
+            # runner dentro de la misma pasada, fuera del presupuesto de tiempo.
+            self.env["ir.cron"]._notify_progress(done=processed, remaining=0)
             if fields.Datetime.now() >= deadline:
                 _logger.info(
                     "GQ Runner: deadline alcanzado (%ds), re-disparando cron", max_seconds
@@ -453,6 +509,35 @@ class GQJob(models.Model):
                 break
             job = self._gq_acquire_one_job()
         _logger.debug("GQ Job Runner finished (%d jobs processed)", processed)
+
+    # ── Limpieza ──────────────────────────────────────────────────────────────
+
+    @api.autovacuum
+    def _gc_finished_jobs(self):
+        """Borra jobs hechos o cancelados mas antiguos que el periodo de retencion.
+
+        Dias en el parametro ``gq_queue.keep_done_days`` (0 = no borrar).
+        Los jobs fallidos se conservan para su revision.
+        """
+        days = int(
+            self.env["ir.config_parameter"]
+            .sudo()
+            .get_param("gq_queue.keep_done_days", DEFAULT_KEEP_DONE_DAYS)
+        )
+        if days <= 0:
+            return
+        self.env.flush_all()
+        self.env.cr.execute(
+            """
+            DELETE FROM gq_job
+            WHERE state IN ('done', 'cancelled')
+              AND date_done < (now() AT TIME ZONE 'UTC') - make_interval(days => %s)
+            """,
+            (days,),
+        )
+        if self.env.cr.rowcount:
+            self.invalidate_model()
+            _logger.info("GQ Queue: %d job(s) terminados borrados", self.env.cr.rowcount)
 
     # ── Triggers de cron ──────────────────────────────────────────────────────
 

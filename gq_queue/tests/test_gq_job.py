@@ -2,6 +2,7 @@ from datetime import timedelta
 from unittest.mock import patch
 
 from odoo import fields
+from odoo.exceptions import AccessError, UserError
 from odoo.tests import TransactionCase, new_test_user, tagged
 from odoo.tools import config
 
@@ -17,29 +18,32 @@ class TestGQJob(TransactionCase):
         cls.partner = cls.env["res.partner"].create({"name": "GQ"})
         cls.Job = cls.env["gq.job"]
 
-    def _patch_probe(self, side_effect=None):
-        """Agrega a res.partner una funcion de prueba que registra su entorno."""
-        calls = []
+    def setUp(self):
+        """Agrega a res.partner funciones de prueba que registran su entorno."""
+        super().setUp()
+        self.calls = []
+        self.side_effect = None
+        test = self
 
         def gq_probe(records, *args, **kwargs):
-            calls.append(
+            test.calls.append(
                 {
                     "uid": records.env.uid,
                     "su": records.env.su,
                     "context": dict(records.env.context),
                     "ids": records.ids,
                     "args": args,
+                    "kwargs": kwargs,
                 }
             )
-            if side_effect:
-                raise side_effect
+            if test.side_effect:
+                raise test.side_effect
 
-        patcher = patch.object(
-            type(self.env["res.partner"]), "gq_probe", gq_probe, create=True
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        return calls
+        partner_cls = type(self.env["res.partner"])
+        for name in ("gq_probe", "_gq_probe"):
+            patcher = patch.object(partner_cls, name, gq_probe, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def _run(self):
         self.Job._gq_job_runner(commit=False)
@@ -65,42 +69,86 @@ class TestGQJob(TransactionCase):
         )
         self.assertTrue(job.exists())
 
+    def test_enqueue_private_function(self):
+        job = self.partner.with_gq_delay()._gq_probe(1)
+        self._run()
+        self.assertEqual(job.state, "done", job.exc_info)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_enqueue_unknown_function(self):
+        with self.assertRaises(AttributeError):
+            self.partner.with_gq_delay().gq_no_such_function()
+        with self.assertRaises(AttributeError):
+            # un campo no es una funcion
+            self.partner.with_gq_delay().name()
+
+    def test_chunk_size(self):
+        partners = self.env["res.partner"].create(
+            [{"name": f"GQ {i}"} for i in range(5)]
+        )
+        jobs = partners.with_gq_delay(chunk_size=2).gq_probe("x")
+        self.assertEqual(len(jobs), 3)
+        self._run()
+        self.assertEqual(set(jobs.mapped("state")), {"done"})
+        self.assertEqual(
+            [call["ids"] for call in self.calls],
+            [partners[:2].ids, partners[2:4].ids, partners[4:].ids],
+        )
+        self.assertTrue(jobs[0].name.endswith("[1/3]"))
+
+    def test_chunk_size_not_needed(self):
+        jobs = self.partner.with_gq_delay(chunk_size=10).gq_probe()
+        self.assertEqual(len(jobs), 1)
+
+    def test_identity_key(self):
+        first = self.partner.with_gq_delay(identity_key="sync-1").gq_probe()
+        again = self.partner.with_gq_delay(identity_key="sync-1").gq_probe()
+        other = self.partner.with_gq_delay(identity_key="sync-2").gq_probe()
+        self.assertEqual(first, again)
+        self.assertNotEqual(first, other)
+        self._run()
+        self.assertEqual(first.state, "done")
+        after = self.partner.with_gq_delay(identity_key="sync-1").gq_probe()
+        self.assertNotEqual(first, after, "Un job terminado no bloquea la clave")
+
+    def test_identity_key_with_chunk_size(self):
+        with self.assertRaises(ValueError):
+            self.partner.with_gq_delay(identity_key="k", chunk_size=2)
+
     # ── Entorno de ejecucion ──────────────────────────────────────────────────
 
     def test_run_with_enqueuing_user_and_context(self):
-        calls = self._patch_probe()
         partner = self.partner.with_user(self.user).with_context(lang="en_US", foo=1)
         job = partner.with_gq_delay().gq_probe(5)
         self._run()
         self.assertEqual(job.state, "done", job.exc_info)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["uid"], self.user.id)
-        self.assertFalse(calls[0]["su"])
-        self.assertEqual(calls[0]["context"].get("lang"), "en_US")
-        self.assertNotIn("foo", calls[0]["context"])
-        self.assertEqual(calls[0]["ids"], self.partner.ids)
-        self.assertEqual(calls[0]["args"], (5,))
+        self.assertEqual(len(self.calls), 1)
+        call = self.calls[0]
+        self.assertEqual(call["uid"], self.user.id)
+        self.assertFalse(call["su"])
+        self.assertEqual(call["context"].get("lang"), "en_US")
+        self.assertNotIn("foo", call["context"])
+        self.assertEqual(call["ids"], self.partner.ids)
+        self.assertEqual(call["args"], (5,))
 
     def test_run_keeps_sudo(self):
-        calls = self._patch_probe()
         job = self.partner.with_user(self.user).sudo().with_gq_delay().gq_probe()
         self.assertTrue(job.run_sudo)
         self._run()
         self.assertEqual(job.state, "done", job.exc_info)
-        self.assertEqual(calls[0]["uid"], self.user.id)
-        self.assertTrue(calls[0]["su"])
+        self.assertEqual(self.calls[0]["uid"], self.user.id)
+        self.assertTrue(self.calls[0]["su"])
 
     # ── Intentos ──────────────────────────────────────────────────────────────
 
     def test_attempt_counted_at_start(self):
-        self._patch_probe()
         job = self.partner.with_gq_delay().gq_probe()
         self._run()
         self.assertEqual(job.state, "done")
         self.assertEqual(job.retry_count, 1)
 
     def test_retryable_until_max_retries(self):
-        self._patch_probe(side_effect=GQRetryableJobError("later", seconds=30))
+        self.side_effect = GQRetryableJobError("later", seconds=30)
         job = self.partner.with_gq_delay(max_retries=1).gq_probe()
         self._run()
         self.assertEqual(job.state, "pending")
@@ -112,7 +160,7 @@ class TestGQJob(TransactionCase):
         self.assertEqual(job.retry_count, 2)
 
     def test_unexpected_error_fails_without_breaking_runner(self):
-        self._patch_probe(side_effect=ValueError("boom"))
+        self.side_effect = ValueError("boom")
         job = self.partner.with_gq_delay().gq_probe()
         self._run()
         self.assertEqual(job.state, "failed")
@@ -176,9 +224,93 @@ class TestGQJob(TransactionCase):
             self.assertEqual(self.Job._gq_time_limit(), 0)
 
     def test_runner_stops_at_budget_and_retriggers(self):
-        calls = self._patch_probe()
         self.partner.with_gq_delay().gq_probe(1)
         second = self.partner.with_gq_delay().gq_probe(2)
         self.Job._gq_job_runner(commit=False, max_seconds=0)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(self.calls), 1)
         self.assertEqual(second.state, "pending")
+
+    def test_runner_notifies_cron_progress(self):
+        cron = self.env.ref("gq_queue.gq_job_cron")
+        cron, progress = cron._add_progress()
+        self.partner.with_gq_delay().gq_probe(1)
+        self.partner.with_gq_delay().gq_probe(2)
+        self.Job.with_context(**cron.env.context)._gq_job_runner(commit=False)
+        self.assertEqual(progress.done, 2)
+        self.assertEqual(
+            progress.remaining, 0, "remaining > 0 relanzaria el runner sin presupuesto"
+        )
+
+    # ── Acciones de usuario ───────────────────────────────────────────────────
+
+    def test_requeue_failed_job(self):
+        self.side_effect = ValueError("boom")
+        job = self.partner.with_gq_delay().gq_probe()
+        self._run()
+        self.assertEqual(job.state, "failed")
+        self.side_effect = None
+        job.action_requeue()
+        self.assertEqual(job.state, "pending")
+        self.assertEqual(job.retry_count, 0)
+        self.assertFalse(job.exc_info)
+        self._run()
+        self.assertEqual(job.state, "done")
+
+    def test_requeue_pending_job_is_rejected(self):
+        job = self.partner.with_gq_delay().gq_probe()
+        with self.assertRaises(UserError):
+            job.action_requeue()
+
+    def test_cancel(self):
+        job = self.partner.with_gq_delay().gq_probe()
+        job.action_cancel()
+        self.assertEqual(job.state, "cancelled")
+        self._run()
+        self.assertFalse(self.calls)
+        started = self._make_started(minutes_ago=0, attempts=1)
+        with self.assertRaises(UserError):
+            started.action_cancel()
+
+    def test_actions_require_write_access(self):
+        job = self.partner.with_gq_delay().gq_probe()
+        with self.assertRaises(AccessError):
+            job.with_user(self.user).action_cancel()
+        with self.assertRaises(AccessError):
+            job.with_user(self.user).action_requeue()
+
+    # ── Limpieza ──────────────────────────────────────────────────────────────
+
+    def test_gc_finished_jobs(self):
+        old = fields.Datetime.now() - timedelta(days=40)
+        recent = fields.Datetime.now() - timedelta(days=5)
+        jobs = self.Job
+        for state, date_done in (
+            ("done", old),
+            ("cancelled", old),
+            ("failed", old),
+            ("done", recent),
+        ):
+            job = self.partner.with_gq_delay().gq_probe()
+            job.write({"state": state, "date_done": date_done})
+            jobs |= job
+        self.Job._gc_finished_jobs()
+        self.assertEqual(
+            jobs.exists().mapped("state"),
+            ["failed", "done"],
+            "Solo se borran hechos y cancelados fuera del periodo de retencion",
+        )
+
+    def test_gc_disabled(self):
+        self.env["ir.config_parameter"].set_param("gq_queue.keep_done_days", "0")
+        job = self.partner.with_gq_delay().gq_probe()
+        job.write(
+            {"state": "done", "date_done": fields.Datetime.now() - timedelta(days=400)}
+        )
+        self.Job._gc_finished_jobs()
+        self.assertTrue(job.exists())
+
+    def test_pending_index_exists(self):
+        self.env.cr.execute(
+            "SELECT 1 FROM pg_indexes WHERE indexname = 'gq_job_pending_idx'"
+        )
+        self.assertTrue(self.env.cr.fetchone())

@@ -11,6 +11,10 @@
                   decoration-muted="state == 'cancelled'"
                   decoration-success="state == 'done'"
                   decoration-warning="state == 'started'">
+                <header>
+                    <button name="action_requeue" type="object" string="Requeue"/>
+                    <button name="action_cancel" type="object" string="Cancel"/>
+                </header>
                 <field name="name"/>
                 <field name="model_name"/>
                 <field name="method_name"/>
@@ -35,6 +39,11 @@
         <field name="arch" type="xml">
             <form>
                 <header>
+                    <button name="action_requeue" type="object" string="Requeue"
+                            class="oe_highlight"
+                            invisible="state not in ('failed', 'cancelled', 'done')"/>
+                    <button name="action_cancel" type="object" string="Cancel"
+                            invisible="state not in ('pending', 'failed')"/>
                     <field name="state" widget="statusbar"
                            statusbar_visible="pending,started,done,failed"/>
                 </header>
@@ -44,6 +53,7 @@
                             <field name="name"/>
                             <field name="uuid"/>
                             <field name="channel"/>
+                            <field name="identity_key"/>
                             <field name="priority"/>
                         </group>
                         <group string="Execution">
@@ -107,6 +117,8 @@
                         domain="[('state','=','failed')]"/>
                 <filter name="done" string="Done"
                         domain="[('state','=','done')]"/>
+                <filter name="cancelled" string="Cancelled"
+                        domain="[('state','=','cancelled')]"/>
                 <separator/>
                 <group expand="0" string="Group By">
                     <filter name="group_state" string="State"
