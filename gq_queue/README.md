@@ -1,6 +1,6 @@
 # GQ Queue
 
-Módulo Odoo 16 para ejecución asíncrona de tareas en segundo plano mediante CronWorkers de Odoo. No requiere proceso externo ni depende de `queue_job`.
+Módulo Odoo 18 para ejecución asíncrona de tareas en segundo plano mediante CronWorkers de Odoo. No requiere proceso externo ni depende de `queue_job`.
 
 ---
 
@@ -94,10 +94,12 @@ gq_queue/
 │   └── ir_cron.py             # Agrega campo gq_job_runner a ir.cron
 ├── security/
 │   └── ir.model.access.csv
+├── tests/
+│   └── test_gq_job.py
 ├── data/
 │   └── ir_cron.xml            # Cron "GQ Queue Job Runner"
 └── views/
-    ├── gq_job_views.xml       # Vistas tree, form, search y menú
+    ├── gq_job_views.xml       # Vistas list, form, search y menú
     └── ir_cron_views.xml      # Agrega campo gq_job_runner al form de ir.cron
 ```
 
@@ -118,11 +120,15 @@ Tabla PostgreSQL: `gq_job`
 | `record_ids` | Text | JSON array con los IDs del recordset (`[1, 2, 3]`) |
 | `args` | Text | JSON array con argumentos posicionales |
 | `kwargs` | Text | JSON object con argumentos nombrados |
+| `user_id` | Many2one | Usuario que encoló el job. El job se ejecuta con este usuario |
+| `company_id` | Many2one | Compañía activa al encolar |
+| `run_sudo` | Boolean | El job se encoló desde un recordset con `sudo()` y se ejecuta igual |
+| `context` | Text | JSON object con las claves de contexto conservadas (`lang`, `tz`, `allowed_company_ids`, `active_test`) |
 | `state` | Selection | Estado actual del job (ver sección 5) |
 | `priority` | Integer | Prioridad de ejecución. Menor = más urgente. Default: `10` |
 | `eta` | Datetime | No ejecutar antes de esta fecha/hora UTC |
 | `max_retries` | Integer | Máximo de reintentos en error retryable. `0` = sin límite. Default: `5` |
-| `retry_count` | Integer | Número de reintentos realizados hasta ahora |
+| `retry_count` | Integer | Número de intentos iniciados (se cuenta al pasar a `started`) |
 | `channel` | Char | Canal lógico (informativo). Default: `"root"` |
 | `result` | Text | Mensaje de resultado (éxito o descripción del reintento) |
 | `exc_info` | Text | Traceback completo en caso de fallo |
@@ -163,7 +169,7 @@ Los jobs se toman de la cola ordenados por:
 | Estado | Descripción |
 |---|---|
 | `pending` | Esperando ser tomado por el runner. Estado inicial. |
-| `started` | Runner lo tomó y está ejecutando el método. |
+| `started` | Runner lo tomó y está ejecutando el método. Se confirma en BD antes de ejecutar. |
 | `done` | Método ejecutado correctamente. |
 | `failed` | El job falló definitivamente (ver `exc_info`). |
 | `cancelled` | Cancelado manualmente mediante `_gq_set_cancelled()`. |
@@ -298,8 +304,8 @@ def mi_metodo(self):
 ```
 
 **Comportamiento:**
-- Incrementa `retry_count` en cada reintento.
-- Si `retry_count >= max_retries` (y `max_retries > 0`), el job pasa a `failed`.
+- `retry_count` cuenta intentos iniciados; se incrementa al pasar a `started`.
+- Un job admite `max_retries` reintentos después del primer intento: si `retry_count > max_retries` (y `max_retries > 0`), pasa a `failed`.
 - `seconds=None` equivale a 5 segundos.
 
 ### `GQFailedJobError`
@@ -365,21 +371,53 @@ _gq_cron_trigger(at=eta_datetime)
 ### Flujo interno de `_gq_job_runner()`
 
 ```python
-def _gq_job_runner(self, commit=True):
+def _gq_job_runner(self, commit=True, max_seconds=None):
+    self._gq_recover_started_jobs()    # reencola o falla jobs huérfanos
     job = self._gq_acquire_one_job()   # SQL SELECT ... FOR NO KEY UPDATE SKIP LOCKED
     while job:
         job._gq_process(commit=commit) # ejecuta + actualiza estado
+        if presupuesto_agotado:
+            self._gq_cron_trigger()    # continúa en la siguiente ejecución del cron
+            break
         job = self._gq_acquire_one_job()
-    # termina cuando no hay más jobs pendientes
+    # termina cuando no hay más jobs pendientes o se agota el presupuesto
 ```
+
+### Presupuesto de tiempo
+
+`max_seconds` es por defecto **la mitad del límite de tiempo del servidor** para crons
+(`limit_time_real_cron`; si vale `-1`, `limit_time_real`). La otra mitad queda como margen
+para que termine el job en curso. Sin límite configurado (`0`), el presupuesto es 600 s.
+
+El presupuesto se revisa **entre jobs**: un job individual debe durar menos que el margen
+(la mitad del límite). Un job más largo debe dividirse en varios jobs.
+
+### Jobs huérfanos
+
+El runner confirma en BD el estado `started` y el intento **antes** de ejecutar, y mantiene
+bloqueada la fila del job hasta terminar. Si el worker muere (timeout, memoria, reinicio),
+el job queda en `started` sin bloqueo. El siguiente runner lo detecta cuando además inició
+hace más tiempo que el límite del servidor, y:
+
+- lo devuelve a `pending` si le quedan intentos;
+- lo pasa a `failed` si `retry_count > max_retries` (con `max_retries = 0`, tras 5 intentos).
+
+Así un job que mata al worker no se reintenta sin fin. El runner se programa solo para
+revisar el job cuando se cumple el plazo.
+
+**Las funciones encoladas no deben hacer `cr.commit()`**: el commit suelta el bloqueo de la
+fila. Con límite de tiempo configurado, la condición de antigüedad protege al job; sin
+límite (`0`) y con varios runners, otro runner podría ejecutarlo dos veces.
 
 ### Flujo interno de `_gq_process()`
 
 ```
-_gq_set_started()          → state = 'started', date_started = now()
+_gq_set_started()          → state = 'started', date_started = now(), retry_count + 1
+commit + bloqueo de fila   → 'started' visible; si el worker muere, el job es huérfano
     │
     ├── savepoint
     │       ├── _gq_perform()              → ejecuta model.method(*args, **kwargs)
+    │       │                                con usuario, sudo y contexto del encolado
     │       └── _gq_set_done()            → state = 'done'
     │
     ├── OperationalError (PG concurrency) → _gq_postpone_pending(seconds=5, reset_retry=True)
@@ -426,7 +464,6 @@ Por defecto hay **1 cron → 1 worker**. Para N workers en paralelo:
     <field name="user_id" ref="base.user_root"/>
     <field name="interval_number">1</field>
     <field name="interval_type">days</field>
-    <field name="numbercall">-1</field>
 </record>
 ```
 
@@ -450,10 +487,16 @@ Con N crons y `max_cron_threads = N`, todos los crons se disparan simultáneamen
 # Número de CronWorkers disponibles (debe ser >= número de crons gq_job_runner)
 max_cron_threads = 2
 
-# Opcional: deshabilitar timeout de CPU para CronWorkers
-# Evita que jobs largos sean interrumpidos abruptamente
-# limit_time_real_cron = 0   # En Odoo.sh esto ya está configurado por defecto
+# Límite de tiempo real de una ejecución de cron. El runner usa la mitad como
+# presupuesto. En Odoo.sh no es configurable: el runner lee el valor vigente.
+# limit_time_real_cron = 900
 ```
+
+### Permisos
+
+- Encolar con `with_gq_delay()` no requiere permisos sobre `gq.job` (se crea con `sudo()`).
+- Solo `base.group_system` puede leer y gestionar los jobs y ver el menú **GQ Queue**.
+- El job se ejecuta con el usuario, el modo `sudo()` y el contexto de quien lo encoló.
 
 ### Variables de entorno
 
@@ -508,7 +551,8 @@ raise GQNothingToDoJob("mensaje")
 | Limitación | Detalle |
 |---|---|
 | **Sin gestión de canales** | El campo `channel` es informativo. No hay control de capacidad por canal. |
-| **Sin detección de jobs huérfanos** | Si Odoo se reinicia con un job en `started`, quedará atascado. Requiere corrección manual (`state → pending`). |
-| **Timeout de CronWorker** | Si `limit_time_real_cron` está configurado y un job tarda demasiado, el proceso será interrumpido. Usar `limit_time_real_cron = 0` para deshabilitar. |
+| **Job más largo que el margen** | Un job que dura más que la mitad del límite de tiempo del servidor puede ser interrumpido. Se reintenta como huérfano hasta agotar intentos. Dividirlo en jobs más chicos. |
+| **Sin `cr.commit()` en jobs** | El commit dentro de la función encolada suelta el bloqueo de la fila (ver sección 10, *Jobs huérfanos*). |
+| **Solo funciones públicas** | `with_gq_delay()` rechaza nombres que empiezan con `_`. |
 | **Recordsets no serializables** | No se pueden pasar recordsets como args/kwargs. Usar IDs. |
 | **Sin prioridad por canal** | La selección de jobs es global por `priority` + `date_created`, sin considerar canales. |

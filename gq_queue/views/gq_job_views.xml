@@ -4,10 +4,10 @@
     <!-- ── List view ──────────────────────────────────────────────────────── -->
 
     <record id="gq_job_view_tree" model="ir.ui.view">
-        <field name="name">gq.job.tree</field>
+        <field name="name">gq.job.list</field>
         <field name="model">gq.job</field>
         <field name="arch" type="xml">
-            <tree decoration-danger="state == 'failed'"
+            <list decoration-danger="state == 'failed'"
                   decoration-muted="state == 'cancelled'"
                   decoration-success="state == 'done'"
                   decoration-warning="state == 'started'">
@@ -17,11 +17,13 @@
                 <field name="state"/>
                 <field name="priority"/>
                 <field name="channel"/>
+                <field name="user_id" optional="show"/>
+                <field name="company_id" optional="hide" groups="base.group_multi_company"/>
                 <field name="eta"/>
                 <field name="retry_count"/>
                 <field name="date_created"/>
                 <field name="date_done"/>
-            </tree>
+            </list>
         </field>
     </record>
 
@@ -50,6 +52,12 @@
                             <field name="eta"/>
                             <field name="max_retries"/>
                             <field name="retry_count"/>
+                        </group>
+                        <group string="Environment">
+                            <field name="user_id"/>
+                            <field name="company_id" groups="base.group_multi_company"/>
+                            <field name="run_sudo"/>
+                            <field name="context"/>
                         </group>
                     </group>
                     <notebook>
@@ -117,7 +125,7 @@
     <record id="gq_job_action" model="ir.actions.act_window">
         <field name="name">GQ Queue Jobs</field>
         <field name="res_model">gq.job</field>
-        <field name="view_mode">tree,form</field>
+        <field name="view_mode">list,form</field>
         <field name="search_view_id" ref="gq_job_view_search"/>
         <field name="context">{'search_default_pending': 1}</field>
     </record>
@@ -127,6 +135,7 @@
     <menuitem
         id="gq_queue_menu_root"
         name="GQ Queue"
+        groups="base.group_system"
         sequence="100"/>
 
     <menuitem

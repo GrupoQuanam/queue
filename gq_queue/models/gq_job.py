@@ -6,8 +6,9 @@ from io import StringIO
 
 from psycopg2 import OperationalError
 
-from odoo import _, api, fields, models, tools
+from odoo import _, api, fields, models
 from odoo.service.model import PG_CONCURRENCY_ERRORS_TO_RETRY
+from odoo.tools import config
 
 from ..delay import GQJobEncoder, gq_job_decoder
 from ..exception import GQFailedJobError, GQNothingToDoJob, GQRetryableJobError
@@ -16,6 +17,11 @@ _logger = logging.getLogger(__name__)
 
 # Segundos a esperar tras un error de concurrencia de PostgreSQL
 PG_RETRY = 5
+
+# Presupuesto del runner (segundos) cuando el servidor no impone limite de tiempo
+DEFAULT_RUNNER_SECONDS = 600
+# Intentos permitidos a un job con max_retries = 0 cuyo worker muere al ejecutarlo
+ORPHAN_MAX_ATTEMPTS = 5
 
 GQ_PENDING = "pending"
 GQ_STARTED = "started"
@@ -60,6 +66,36 @@ class GQJob(models.Model):
         help="JSON object con los argumentos nombrados.",
     )
 
+    # ── Con que entorno ejecutar ──────────────────────────────────────────────
+
+    user_id = fields.Many2one(
+        "res.users",
+        string="User",
+        readonly=True,
+        index=True,
+        ondelete="set null",
+        default=lambda self: self.env.uid,
+        help="Usuario que encolo el job. El job se ejecuta con este usuario.",
+    )
+    company_id = fields.Many2one(
+        "res.company",
+        string="Company",
+        readonly=True,
+        ondelete="set null",
+        default=lambda self: self.env.company,
+        help="Compania activa al encolar el job.",
+    )
+    run_sudo = fields.Boolean(
+        string="Superuser Mode",
+        readonly=True,
+        help="El job se encolo desde un recordset con sudo() y se ejecuta igual.",
+    )
+    context = fields.Text(
+        string="Context",
+        readonly=True,
+        help="JSON object con las claves de contexto conservadas al encolar.",
+    )
+
     # ── Estado ────────────────────────────────────────────────────────────────
 
     state = fields.Selection(
@@ -93,9 +129,10 @@ class GQJob(models.Model):
         help="Maximo de reintentos en caso de error retryable. 0 = sin limite.",
     )
     retry_count = fields.Integer(
-        string="Retry Count",
+        string="Attempts",
         default=0,
         readonly=True,
+        help="Numero de veces que el runner inicio la ejecucion del job.",
     )
     channel = fields.Char(
         string="Channel",
@@ -122,8 +159,13 @@ class GQJob(models.Model):
     # ── Maquina de estados ────────────────────────────────────────────────────
 
     def _gq_set_started(self):
+        self.ensure_one()
         self.sudo().write(
-            {"state": GQ_STARTED, "date_started": fields.Datetime.now()}
+            {
+                "state": GQ_STARTED,
+                "date_started": fields.Datetime.now(),
+                "retry_count": self.retry_count + 1,
+            }
         )
 
     def _gq_set_done(self, result=None):
@@ -144,13 +186,16 @@ class GQJob(models.Model):
         )
 
     def _gq_postpone_pending(self, result=None, seconds=PG_RETRY, reset_retry=False):
-        """Volver a pending con una nueva ETA (para reintentos)."""
+        """Volver a pending con una nueva ETA (para reintentos).
+
+        :param reset_retry: si es True, el intento en curso no se cuenta.
+        """
         vals = {
             "state": GQ_PENDING,
             "eta": fields.Datetime.now() + timedelta(seconds=seconds),
         }
-        if not reset_retry:
-            vals["retry_count"] = self.retry_count + 1
+        if reset_retry:
+            vals["retry_count"] = max(self.retry_count - 1, 0)
         if result is not None:
             vals["result"] = str(result)
         self.sudo().write(vals)
@@ -158,13 +203,24 @@ class GQJob(models.Model):
     # ── Ejecucion ─────────────────────────────────────────────────────────────
 
     def _gq_can_retry(self):
-        """True si todavia quedan reintentos disponibles."""
-        return self.max_retries == 0 or self.retry_count < self.max_retries
+        """True si todavia quedan reintentos disponibles.
+
+        ``retry_count`` cuenta intentos iniciados (incluye el que esta en curso),
+        por eso un job admite ``max_retries`` reintentos despues del primero.
+        """
+        return self.max_retries == 0 or self.retry_count <= self.max_retries
+
+    def _gq_job_env(self):
+        """Entorno con el usuario, modo superusuario y contexto del encolado."""
+        self.ensure_one()
+        context = json.loads(self.context or "{}")
+        user = self.user_id.id or self.env.uid
+        return self.env(user=user, su=self.run_sudo, context=context)
 
     def _gq_perform(self):
         """Deserializa y ejecuta el metodo almacenado en el job."""
         self.ensure_one()
-        model = self.env[self.model_name]
+        model = self._gq_job_env()[self.model_name]
         record_ids = json.loads(self.record_ids or "[]")
         args = json.loads(self.args or "[]", object_hook=gq_job_decoder)
         kwargs = json.loads(self.kwargs or "{}", object_hook=gq_job_decoder)
@@ -177,6 +233,13 @@ class GQJob(models.Model):
         """Ejecuta el job y gestiona todos los casos de error."""
         self.ensure_one()
         self._gq_set_started()
+        if commit:
+            # Persistir 'started' y el intento antes de ejecutar: si el worker
+            # muere, el job queda visible como huerfano con su intento contado.
+            self.env.cr.commit()  # pylint: disable=invalid-commit
+            if not self._gq_lock_started():
+                _logger.info("GQ Job #%s tomado por otro runner, se omite", self.id)
+                return
         _logger.debug(
             "GQ Job #%s started: %s.%s", self.id, self.model_name, self.method_name
         )
@@ -191,7 +254,7 @@ class GQJob(models.Model):
                 # Errores de concurrencia de PostgreSQL: reintentar automaticamente
                 if err.pgcode not in PG_CONCURRENCY_ERRORS_TO_RETRY:
                     raise
-                message = tools.ustr(err.pgerror, errors="replace")
+                message = str(err.pgerror or err)
                 self._gq_postpone_pending(result=message, seconds=PG_RETRY, reset_retry=True)
                 _logger.debug("GQ Job #%s OperationalError, postponed %ss", self.id, PG_RETRY)
 
@@ -226,52 +289,114 @@ class GQJob(models.Model):
 
     # ── Runner principal ──────────────────────────────────────────────────────
 
+    def _gq_lock_started(self):
+        """Vuelve a bloquear la fila del job tras confirmar el estado 'started'.
+
+        El bloqueo dura hasta el commit final del job y es lo que distingue a un
+        job en ejecucion de uno huerfano.
+
+        :returns: False si otro runner tomo el job entre el commit y el bloqueo.
+        """
+        self.ensure_one()
+        self.env.cr.execute(
+            """
+            SELECT id
+            FROM gq_job
+            WHERE id = %s AND state = 'started'
+            FOR NO KEY UPDATE SKIP LOCKED
+            """,
+            (self.id,),
+        )
+        return bool(self.env.cr.fetchone())
+
+    @api.model
+    def _gq_time_limit(self):
+        """Segundos tras los que el servidor mata una ejecucion de cron.
+
+        :returns: 0 si no hay limite.
+        """
+        limit = config["limit_time_real_cron"]
+        if limit is None or limit < 0:
+            limit = config["limit_time_real"]
+        return max(limit or 0, 0)
+
     @api.model
     def _gq_recover_started_jobs(self):
-        """Resetea jobs huérfanos en estado 'started' tras un crash del servidor.
+        """Resetea jobs huerfanos en estado 'started' tras la muerte de su worker.
 
-        Un job en 'started' que puede ser bloqueado con SKIP LOCKED no tiene
-        ningún worker activo procesándolo → es huérfano. Se reinicia a 'pending'
-        (o 'failed' si superó max_retries).
+        Un job es huerfano si esta en 'started', su fila no esta bloqueada por
+        ningun runner y ademas inicio hace mas tiempo que el limite del servidor.
+        La condicion de tiempo evita reencolar un job vivo cuya funcion hizo
+        commit (y por tanto solto el bloqueo de su fila).
+
+        El intento ya se conto al iniciar el job: vuelve a 'pending' mientras le
+        queden intentos y si no pasa a 'failed'.
         """
+        grace = self._gq_time_limit()
         self.env.flush_all()
         self.env.cr.execute(
             """
             UPDATE gq_job
             SET
                 state = CASE
-                    WHEN max_retries != 0 AND retry_count >= max_retries
+                    WHEN retry_count > COALESCE(NULLIF(max_retries, 0), %(cap)s)
                     THEN 'failed'
                     ELSE 'pending'
                 END,
-                retry_count = retry_count + 1,
                 exc_info = CASE
-                    WHEN max_retries != 0 AND retry_count >= max_retries
-                    THEN 'Job encontrado muerto: servidor reiniciado durante su ejecución'
+                    WHEN retry_count > COALESCE(NULLIF(max_retries, 0), %(cap)s)
+                    THEN %(message)s
                     ELSE exc_info
                 END,
                 date_done = CASE
-                    WHEN max_retries != 0 AND retry_count >= max_retries
+                    WHEN retry_count > COALESCE(NULLIF(max_retries, 0), %(cap)s)
                     THEN (now() AT TIME ZONE 'UTC')
                     ELSE date_done
                 END
-            WHERE state = 'started'
-              AND id IN (
+            WHERE id IN (
                   SELECT id FROM gq_job
                   WHERE state = 'started'
+                    AND (
+                        date_started IS NULL
+                        OR date_started <= (now() AT TIME ZONE 'UTC')
+                            - make_interval(secs => %(grace)s)
+                    )
                   FOR NO KEY UPDATE SKIP LOCKED
               )
             RETURNING id
-            """
+            """,
+            {
+                "cap": ORPHAN_MAX_ATTEMPTS,
+                "grace": grace,
+                "message": "Job encontrado muerto: su worker termino durante la "
+                "ejecucion y se agotaron los intentos",
+            },
         )
         rows = self.env.cr.fetchall()
         if rows:
             ids = [r[0] for r in rows]
+            self.invalidate_model(["state", "exc_info", "date_done"])
             _logger.warning(
-                "GQ Queue: %d job(s) huérfano(s) recuperado(s) tras reinicio: %s",
-                len(ids),
-                ids,
+                "GQ Queue: %d job(s) huerfano(s) recuperado(s): %s", len(ids), ids
             )
+        if grace:
+            self._gq_schedule_orphan_check(grace)
+
+    @api.model
+    def _gq_schedule_orphan_check(self, grace):
+        """Programa el runner para cuando el 'started' mas antiguo pueda ser huerfano.
+
+        Sin esto, un job cuyo worker murio esperaria al intervalo del cron.
+        """
+        self.env.cr.execute(
+            "SELECT min(date_started) FROM gq_job WHERE state = 'started'"
+        )
+        oldest = self.env.cr.fetchone()[0]
+        if not oldest:
+            return
+        check_at = oldest + timedelta(seconds=grace + 1)
+        if check_at > fields.Datetime.now():
+            self._gq_cron_trigger(at=check_at)
 
     @api.model
     def _gq_acquire_one_job(self):
@@ -297,14 +422,21 @@ class GQJob(models.Model):
         return self.browse(row and row[0])
 
     @api.model
-    def _gq_job_runner(self, commit=True, max_seconds=840):
+    def _gq_job_runner(self, commit=True, max_seconds=None):
         """Punto de entrada del cron: procesa todos los jobs pendientes disponibles.
 
         Llamado por el ir.cron con gq_job_runner=True.
         El loop continua hasta que no queden jobs pendientes o se alcance max_seconds.
         Si se alcanza el deadline, re-dispara el cron para continuar en la siguiente
         ejecución y evitar que el servidor mate el proceso.
+
+        :param max_seconds: presupuesto de la corrida. Por defecto, la mitad del
+            limite de tiempo del servidor: la otra mitad queda como margen para
+            que termine el job en curso.
         """
+        if max_seconds is None:
+            limit = self._gq_time_limit()
+            max_seconds = limit // 2 if limit else DEFAULT_RUNNER_SECONDS
         deadline = fields.Datetime.now() + timedelta(seconds=max_seconds)
         _logger.debug("GQ Job Runner started (deadline en %ds)", max_seconds)
         self._gq_recover_started_jobs()

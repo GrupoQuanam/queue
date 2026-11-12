@@ -6,6 +6,8 @@ _logger = logging.getLogger(__name__)
 
 DEFAULT_PRIORITY = 10
 DEFAULT_MAX_RETRIES = 5
+# Claves de contexto que se conservan al encolar
+CONTEXT_KEYS = ("lang", "tz", "allowed_company_ids", "active_test")
 
 
 class GQJobEncoder(json.JSONEncoder):
@@ -74,8 +76,15 @@ class GQDelayable:
                 ", ".join(repr(a) for a in args[:2]),
             )
 
+            context = {
+                key: env.context[key] for key in CONTEXT_KEYS if key in env.context
+            }
             vals = {
                 "name": description,
+                "user_id": env.uid,
+                "company_id": env.company.id,
+                "run_sudo": env.su,
+                "context": json.dumps(context),
                 "model_name": model_name,
                 "method_name": name,
                 "record_ids": json.dumps(record_ids),
@@ -89,7 +98,8 @@ class GQDelayable:
             if self._eta:
                 vals["eta"] = self._eta
 
-            job = env["gq.job"].create(vals)
+            # sudo(): encolar no requiere permisos sobre gq.job
+            job = env["gq.job"].sudo().create(vals)
             _logger.debug(
                 "GQ enqueued job #%s: %s.%s", job.id, model_name, name
             )
