@@ -145,6 +145,7 @@ Tabla PostgreSQL: `gq_job`
 Los jobs se toman de la cola ordenados por:
 1. `priority ASC` — menor número primero
 2. `date_created ASC` — FIFO dentro de la misma prioridad
+3. `id ASC` — desempate entre jobs creados en el mismo segundo
 
 ---
 
@@ -514,7 +515,7 @@ El método `_gq_acquire_one_job()` usa:
 SELECT id FROM gq_job
 WHERE state = 'pending'
   AND (eta IS NULL OR eta <= (now() AT TIME ZONE 'UTC'))
-ORDER BY priority ASC, date_created ASC
+ORDER BY priority ASC, date_created ASC, id ASC
 LIMIT 1 FOR NO KEY UPDATE SKIP LOCKED
 ```
 

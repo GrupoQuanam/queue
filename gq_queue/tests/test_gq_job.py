@@ -3,54 +3,15 @@ from unittest.mock import patch
 
 from odoo import fields
 from odoo.exceptions import AccessError, UserError
-from odoo.tests import TransactionCase, new_test_user, tagged
+from odoo.tests import tagged
 from odoo.tools import config
 
 from ..exception import GQRetryableJobError
+from .common import GQCommon
 
 
 @tagged("post_install", "-at_install")
-class TestGQJob(TransactionCase):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.user = new_test_user(cls.env, login="gq_user", groups="base.group_user")
-        cls.partner = cls.env["res.partner"].create({"name": "GQ"})
-        cls.Job = cls.env["gq.job"]
-
-    def setUp(self):
-        """Agrega a res.partner funciones de prueba que registran su entorno."""
-        super().setUp()
-        self.calls = []
-        self.side_effect = None
-        self.fail_ids = set()
-        test = self
-
-        def gq_probe(records, *args, **kwargs):
-            test.calls.append(
-                {
-                    "uid": records.env.uid,
-                    "su": records.env.su,
-                    "context": dict(records.env.context),
-                    "ids": records.ids,
-                    "args": args,
-                    "kwargs": kwargs,
-                }
-            )
-            if test.side_effect:
-                raise test.side_effect
-            if test.fail_ids & set(records.ids):
-                raise ValueError("lote con error")
-
-        partner_cls = type(self.env["res.partner"])
-        for name in ("gq_probe", "_gq_probe"):
-            patcher = patch.object(partner_cls, name, gq_probe, create=True)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-
-    def _run(self):
-        self.Job._gq_job_runner(commit=False)
-
+class TestGQJob(GQCommon):
     # ── Encolado ──────────────────────────────────────────────────────────────
 
     def test_enqueue_as_internal_user(self):
@@ -171,17 +132,6 @@ class TestGQJob(TransactionCase):
 
     # ── Huerfanos ─────────────────────────────────────────────────────────────
 
-    def _make_started(self, minutes_ago, attempts, max_retries=5):
-        job = self.partner.with_gq_delay(max_retries=max_retries).gq_probe()
-        job.write(
-            {
-                "state": "started",
-                "date_started": fields.Datetime.now() - timedelta(minutes=minutes_ago),
-                "retry_count": attempts,
-            }
-        )
-        return job
-
     def test_recover_orphans(self):
         retry = self._make_started(minutes_ago=5, attempts=1)
         exhausted = self._make_started(minutes_ago=5, attempts=6)
@@ -282,11 +232,6 @@ class TestGQJob(TransactionCase):
             job.with_user(self.user).action_requeue()
 
     # ── Grupo y dependencias ──────────────────────────────────────────────────
-
-    def _partners(self, count):
-        return self.env["res.partner"].create(
-            [{"name": f"GQ {i}"} for i in range(count)]
-        )
 
     def test_chunks_share_group(self):
         jobs = self._partners(5).with_gq_delay(chunk_size=2).gq_probe()
@@ -438,6 +383,6 @@ class TestGQJob(TransactionCase):
 
     def test_pending_index_exists(self):
         self.env.cr.execute(
-            "SELECT 1 FROM pg_indexes WHERE indexname = 'gq_job_pending_idx'"
+            "SELECT 1 FROM pg_indexes WHERE indexname = 'gq_job_queue_idx'"
         )
         self.assertTrue(self.env.cr.fetchone())

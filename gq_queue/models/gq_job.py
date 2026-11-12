@@ -37,7 +37,7 @@ GQ_CANCELLED = "cancelled"
 class GQJob(models.Model):
     _name = "gq.job"
     _description = "GQ Queue Job"
-    _order = "priority asc, date_created asc"
+    _order = "priority asc, date_created asc, id asc"
 
     # ── Identificacion ────────────────────────────────────────────────────────
 
@@ -205,11 +205,13 @@ class GQJob(models.Model):
     date_done = fields.Datetime(string="Finished At", readonly=True)
 
     def init(self):
-        # La cola se consulta por prioridad y antiguedad solo entre pendientes
+        # La cola se consulta por prioridad y antiguedad solo entre pendientes.
+        # El id desempata los jobs creados en el mismo segundo.
         self.env.cr.execute(
             """
-            CREATE INDEX IF NOT EXISTS gq_job_pending_idx
-            ON gq_job (priority, date_created)
+            DROP INDEX IF EXISTS gq_job_pending_idx;
+            CREATE INDEX IF NOT EXISTS gq_job_queue_idx
+            ON gq_job (priority, date_created, id)
             WHERE state = 'pending'
             """
         )
@@ -610,6 +612,7 @@ class GQJob(models.Model):
 
         Sin esto, un job cuyo worker murio esperaria al intervalo del cron.
         """
+        self.env.flush_all()
         self.env.cr.execute(
             "SELECT min(date_started) FROM gq_job WHERE state = 'started'"
         )
@@ -636,7 +639,7 @@ class GQJob(models.Model):
             FROM gq_job
             WHERE state = 'pending'
               AND (eta IS NULL OR eta <= (now() AT TIME ZONE 'UTC'))
-            ORDER BY priority ASC, date_created ASC
+            ORDER BY priority ASC, date_created ASC, id ASC
             LIMIT 1 FOR NO KEY UPDATE SKIP LOCKED
             """
         )
