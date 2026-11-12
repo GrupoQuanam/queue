@@ -6,7 +6,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: Odoo Server 17.0\n"
 "Report-Msgid-Bugs-To: \n"
-"PO-Revision-Date: 2026-03-24 11:45+0000\n"
+"PO-Revision-Date: 2026-11-08 23:46+0000\n"
 "Last-Translator: mymage <stefano.consolaro@mymage.it>\n"
 "Language-Team: none\n"
 "Language: it\n"
@@ -15,6 +15,11 @@ msgstr ""
 "Content-Transfer-Encoding: \n"
 "Plural-Forms: nplurals=2; plural=n != 1;\n"
 "X-Generator: Weblate 5.15.2\n"
+
+#. module: queue_job
+#: model_terms:ir.ui.view,arch_db:queue_job.view_queue_job_channel_form
+msgid "(effective:"
+msgstr "(effettiva:"
 
 #. module: queue_job
 #: model_terms:ir.ui.view,arch_db:queue_job.view_queue_job_form
@@ -26,6 +31,28 @@ msgstr ""
 "<br/>\n"
 "                            <span class=\"oe_grey oe_inline\"> Se il massimo "
 "di tentativi è 0, il numero di tentativi è infinito.</span>"
+
+#. module: queue_job
+#. odoo-python
+#: code:addons/queue_job/models/queue_job_channel.py:0
+msgid "A channel with a sequential default must have a default capacity of 1."
+msgstr ""
+"Un canale con sequenziale predefinito deve avere una capacità predefinita di "
+"1."
+
+#. module: queue_job
+#: model:ir.model.fields,help:queue_job.field_queue_job_channel__paused
+msgid ""
+"A paused channel (an its subchannels) do not execute any jobs until resumed."
+msgstr ""
+"Un canale in pausa (e i suoi sottocanali) non esegue alcun lavoro finché non "
+"viene ripreso."
+
+#. module: queue_job
+#. odoo-python
+#: code:addons/queue_job/models/queue_job_channel.py:0
+msgid "A sequential channel must have a capacity of 1."
+msgstr "Un canale sequenziale deve avere una capacità di 1."
 
 #. module: queue_job
 #. odoo-python
@@ -57,6 +84,18 @@ msgstr "Stato attività"
 #: model:ir.model.fields,field_description:queue_job.field_queue_job__activity_type_icon
 msgid "Activity Type Icon"
 msgstr "Icona tipo attività"
+
+#. module: queue_job
+#: model:ir.model.fields,help:queue_job.field_queue_job_channel__effective_capacity
+msgid ""
+"Actual capacity of this channel. Its own capacity if set, or the capacity of "
+"the closest parent. The root channel is limited by the server-wide "
+"max_capacity/db_max_capacity configuration."
+msgstr ""
+"Capacità effettiva di questo canale. La propria capacità se impostata, "
+"altrimenti la capacità del canale padre più vicino. Il canale radice è "
+"limitato dalla configurazione a livello di server max_capacity/"
+"db_max_capacity."
 
 #. module: queue_job
 #: model:ir.model.fields,field_description:queue_job.field_queue_job_function__allow_commit
@@ -143,6 +182,13 @@ msgid "Cannot remove the root channel"
 msgstr "Non si può rimuovere il canale radice"
 
 #. module: queue_job
+#. odoo-javascript
+#: code:addons/queue_job/static/src/channel_tree/channel_tree.esm.js:0
+#: model:ir.model.fields,field_description:queue_job.field_queue_job_channel__capacity
+msgid "Capacity"
+msgstr "Capacità"
+
+#. module: queue_job
 #: model:ir.model.fields,field_description:queue_job.field_queue_job__channel
 #: model:ir.model.fields,field_description:queue_job.field_queue_job_function__channel_id
 #: model_terms:ir.ui.view,arch_db:queue_job.view_queue_job_function_search
@@ -162,6 +208,12 @@ msgstr "Il nome completo del canale deve essere univoco"
 #: model_terms:ir.ui.view,arch_db:queue_job.view_queue_job_channel_search
 msgid "Channels"
 msgstr "Canali"
+
+#. module: queue_job
+#: model:ir.actions.client,name:queue_job.action_queue_job_channel_tree
+#: model:ir.ui.menu,name:queue_job.menu_queue_job_channel_tree
+msgid "Channels Tree"
+msgstr "Albero canali"
 
 #. module: queue_job
 #: model:ir.model.fields,field_description:queue_job.field_queue_job__company_id
@@ -228,6 +280,27 @@ msgid "Date Done"
 msgstr "Data completamento"
 
 #. module: queue_job
+#. odoo-javascript
+#: code:addons/queue_job/static/src/channel_tree/channel_tree.esm.js:0
+msgid "Default capacity"
+msgstr "Capacità predefinita"
+
+#. module: queue_job
+#: model:ir.model.fields,help:queue_job.field_queue_job_channel__capacity_default
+msgid ""
+"Default capacity for unconfigured subchannels. 0 means they would have the "
+"same capacity as the current channel."
+msgstr ""
+"Capacità predefinita per i sottocanali non configurati. 0 significa che "
+"avranno la stessa capacità del canale attuale."
+
+#. module: queue_job
+#. odoo-javascript
+#: code:addons/queue_job/static/src/channel_tree/channel_tree.esm.js:0
+msgid "Default sequential"
+msgstr "Sequenziale predefinito"
+
+#. module: queue_job
 #: model:ir.model.fields,field_description:queue_job.field_queue_job__dependencies
 #: model_terms:ir.ui.view,arch_db:queue_job.view_queue_job_form
 msgid "Dependencies"
@@ -259,6 +332,28 @@ msgstr "Nome visualizzato"
 #: model_terms:ir.ui.view,arch_db:queue_job.view_queue_job_search
 msgid "Done"
 msgstr "Completata"
+
+#. module: queue_job
+#: model:ir.model.fields,field_description:queue_job.field_queue_job_channel__effective_capacity
+msgid "Effective Capacity"
+msgstr "Capacità effettiva"
+
+#. module: queue_job
+#: model:ir.model.fields,field_description:queue_job.field_queue_job_channel__effective_paused
+msgid "Effective Paused"
+msgstr "Pausa effettiva"
+
+#. module: queue_job
+#. odoo-javascript
+#: code:addons/queue_job/static/src/channel_tree/channel_tree.esm.js:0
+msgid "Effective capacity"
+msgstr "Capacità effettiva"
+
+#. module: queue_job
+#. odoo-javascript
+#: code:addons/queue_job/static/src/channel_tree/channel_tree.esm.js:0
+msgid "Effective capacity: %s"
+msgstr "Capacità effettiva: %s"
 
 #. module: queue_job
 #: model:ir.model.fields,field_description:queue_job.field_queue_job__date_enqueued
@@ -411,6 +506,20 @@ msgid "If checked, some messages have a delivery error."
 msgstr "Se selezionata, alcuni messaggi hanno un errore di consegna."
 
 #. module: queue_job
+#: model:ir.model.fields,help:queue_job.field_queue_job_channel__sequential_default
+msgid "If sequential is enabled for unconfigured subchannels."
+msgstr ""
+"Indica se la modalità sequenziale è abilitata per i sottocanali non "
+"configurati."
+
+#. module: queue_job
+#: model:ir.model.fields,help:queue_job.field_queue_job_channel__effective_paused
+msgid "If this channel is actually paused, depending on the parents."
+msgstr ""
+"Indica se questo canale è effettivamente in pausa, anche in base ai canali "
+"padre."
+
+#. module: queue_job
 #. odoo-python
 #: code:addons/queue_job/models/queue_job_function.py:0
 msgid "Invalid job function: {}"
@@ -437,6 +546,7 @@ msgstr "Funzione lavoro"
 #: model:ir.model,name:queue_job.model_queue_job_function
 #: model:ir.model.fields,field_description:queue_job.field_queue_job_channel__job_function_ids
 #: model:ir.ui.menu,name:queue_job.menu_queue_job_function
+#: model_terms:ir.ui.view,arch_db:queue_job.view_queue_job_channel_form
 #: model_terms:ir.ui.view,arch_db:queue_job.view_queue_job_function_form
 #: model_terms:ir.ui.view,arch_db:queue_job.view_queue_job_function_search
 msgid "Job Functions"
@@ -452,6 +562,11 @@ msgstr "Coda lavoro"
 #: model:res.groups,name:queue_job.group_queue_job_manager
 msgid "Job Queue Manager"
 msgstr "Gestore coda lavoro"
+
+#. module: queue_job
+#: model_terms:ir.ui.view,arch_db:queue_job.view_queue_job_channel_form
+msgid "Job Runner"
+msgstr "Esecutore lavori"
 
 #. module: queue_job
 #: model:ir.model.fields.selection,name:queue_job.selection__ir_model_fields__ttype__job_serialized
@@ -475,6 +590,15 @@ msgstr "Lavro fallito"
 #: model_terms:ir.ui.view,arch_db:queue_job.view_queue_job_search
 msgid "Jobs"
 msgstr "Lavori"
+
+#. module: queue_job
+#: model:ir.model.fields,help:queue_job.field_queue_job_channel__sequential
+msgid ""
+"Jobs are executed one after the other and failed jobs block the channel. "
+"Requires a capacity of 1."
+msgstr ""
+"I lavori vengono eseguiti uno dopo l'altro e i lavori falliti bloccano il "
+"canale. Richiede una capacità di 1."
 
 #. module: queue_job
 #. odoo-python
@@ -532,6 +656,18 @@ msgid "Max. retries"
 msgstr "Massimo tentativi"
 
 #. module: queue_job
+#: model:ir.model.fields,help:queue_job.field_queue_job_channel__capacity
+msgid ""
+"Maximum number of jobs running at the same time in this channel. 0 means no "
+"limit, but they are still limited by the capacity of the parent channel. On "
+"the root channel, 0 is limited by the global server-wide configuration."
+msgstr ""
+"Numero massimo di lavori in esecuzione contemporaneamente in questo canale. "
+"0 significa nessun limite, ma sono comunque limitati dalla capacità del "
+"canale padre. Sul canale radice, 0 è limitato dalla configurazione globale a "
+"livello di server."
+
+#. module: queue_job
 #: model:ir.model.fields,field_description:queue_job.field_queue_job__message_has_error
 msgid "Message Delivery error"
 msgstr "Errore di consegna messaggio"
@@ -552,6 +688,11 @@ msgid "Method Name"
 msgstr "Nome metodo"
 
 #. module: queue_job
+#: model:ir.model.fields,help:queue_job.field_queue_job_channel__throttle
+msgid "Minimum delay in seconds between the start of two jobs in this channel."
+msgstr "Ritardo minimo in secondi tra l'avvio di due lavori in questo canale."
+
+#. module: queue_job
 #: model:ir.model.fields,field_description:queue_job.field_queue_job__model_name
 #: model:ir.model.fields,field_description:queue_job.field_queue_job_function__model_id
 #: model_terms:ir.ui.view,arch_db:queue_job.view_queue_job_search
@@ -563,6 +704,7 @@ msgstr "Modello"
 msgid ""
 "Model function to be called if the job is failed and will not be retried."
 msgstr ""
+"Modello funziona da chiamare se il lavoro fallisce e non verrà ricevuto."
 
 #. module: queue_job
 #. odoo-python
@@ -614,6 +756,11 @@ msgid "Number of Actions"
 msgstr "Numero di azioni"
 
 #. module: queue_job
+#: model:ir.model.fields,help:queue_job.field_queue_job_channel__removal_interval
+msgid "Number of days after which done jobs are deleted."
+msgstr "Numero di giorni dopo i quali i lavori completati vengono eliminati."
+
+#. module: queue_job
 #: model:ir.model.fields,field_description:queue_job.field_queue_job__message_has_error_counter
 msgid "Number of errors"
 msgstr "Numero di errori"
@@ -631,7 +778,7 @@ msgstr "Numero di messaggi con errore di consegna"
 #. module: queue_job
 #: model:ir.model.fields,field_description:queue_job.field_queue_job_function__on_fail_method
 msgid "On Fail Method"
-msgstr ""
+msgstr "Metodo al fallimento"
 
 #. module: queue_job
 #: model:ir.model.fields,field_description:queue_job.field_queue_job_channel__parent_id
@@ -662,6 +809,17 @@ msgstr ""
 "Esempio: {1: 10, 5: 20, 10: 30, 15: 300}.\n"
 "Esempio: {1: (1, 10), 5: (11, 20), 10: (21, 30), 15: (100, 300)}.\n"
 "Vedere la descrizione del modulo per i dettagli."
+
+#. module: queue_job
+#: model_terms:ir.ui.view,arch_db:queue_job.view_queue_job_channel_form
+msgid "Pause"
+msgstr "Metti in pausa"
+
+#. module: queue_job
+#: model:ir.model.fields,field_description:queue_job.field_queue_job_channel__paused
+#: model_terms:ir.ui.view,arch_db:queue_job.view_queue_job_channel_search
+msgid "Paused"
+msgstr "In pausa"
 
 #. module: queue_job
 #: model:ir.model.fields.selection,name:queue_job.selection__queue_job__state__pending
@@ -766,6 +924,11 @@ msgid "Results"
 msgstr "Risultati"
 
 #. module: queue_job
+#: model_terms:ir.ui.view,arch_db:queue_job.view_queue_job_channel_form
+msgid "Resume"
+msgstr "Riprendi"
+
+#. module: queue_job
 #: model:ir.model.fields,field_description:queue_job.field_queue_job_function__edit_retry_pattern
 msgid "Retry Pattern"
 msgstr "Riprova schema"
@@ -774,6 +937,19 @@ msgstr "Riprova schema"
 #: model:ir.model.fields,field_description:queue_job.field_queue_job_function__retry_pattern
 msgid "Retry Pattern (serialized)"
 msgstr "Riprova schema (serializzato)"
+
+#. module: queue_job
+#. odoo-javascript
+#: code:addons/queue_job/static/src/channel_tree/channel_tree.esm.js:0
+#: model:ir.model.fields,field_description:queue_job.field_queue_job_channel__sequential
+msgid "Sequential"
+msgstr "Sequenziale"
+
+#. module: queue_job
+#. odoo-javascript
+#: code:addons/queue_job/static/src/channel_tree/channel_tree.esm.js:0
+msgid "Server capacity: %s"
+msgstr "Capacità server: %s"
 
 #. module: queue_job
 #: model:ir.model,name:queue_job.model_queue_jobs_to_done
@@ -847,6 +1023,16 @@ msgstr ""
 "Pianificato: attività future."
 
 #. module: queue_job
+#: model:ir.model.fields,field_description:queue_job.field_queue_job_channel__capacity_default
+msgid "Subchannels Default Capacity"
+msgstr "Capacità predefinita sottocanali"
+
+#. module: queue_job
+#: model:ir.model.fields,field_description:queue_job.field_queue_job_channel__sequential_default
+msgid "Subchannels Default Sequential"
+msgstr "Sequenziale predefinito sottocanali"
+
+#. module: queue_job
 #: model:ir.model.fields,field_description:queue_job.field_queue_job__func_string
 msgid "Task"
 msgstr "Lavoro"
@@ -865,6 +1051,18 @@ msgstr ""
 "Vedere la descrizione del modulo per i dettagli."
 
 #. module: queue_job
+#. odoo-python
+#: code:addons/queue_job/models/queue_job_channel.py:0
+msgid "The capacity of a channel cannot be negative."
+msgstr "La capacità di un canale non può essere negativa."
+
+#. module: queue_job
+#. odoo-python
+#: code:addons/queue_job/models/queue_job_channel.py:0
+msgid "The default capacity of a channel cannot be negative."
+msgstr "La capacità predefinita di un canale non può essere negativa."
+
+#. module: queue_job
 #: model:ir.model.fields,help:queue_job.field_queue_job__max_retries
 msgid ""
 "The job will fail if the number of tries reach the max. retries.\n"
@@ -872,6 +1070,35 @@ msgid ""
 msgstr ""
 "Il lavoro fallirà se il numero di tentativi raggiunge il massimo.\n"
 "I tentativi sono infiniti quando vuoto."
+
+#. module: queue_job
+#: model_terms:ir.ui.view,arch_db:queue_job.view_queue_job_channel_form
+msgid ""
+"The properties shown here are only\n"
+"                            relevant when the per-database\n"
+"                            channels are used, not when\n"
+"                            server-wide channels configuration\n"
+"                            is used."
+msgstr ""
+"Le proprietà mostrate qui sono rilevanti\n"
+"                            solo quando vengono utilizzati i canali\n"
+"                            per database, non quando viene utilizzata\n"
+"                            la configurazione dei canali\n"
+"                            a livello di server."
+
+#. module: queue_job
+#. odoo-javascript
+#: code:addons/queue_job/static/src/channel_tree/channel_tree.xml:0
+msgid ""
+"The properties shown here are only relevant when the\n"
+"                per-database channels are used, not when server-wide "
+"channels\n"
+"                configuration is used."
+msgstr ""
+"Le proprietà mostrate qui sono rilevanti solo quando\n"
+"                vengono utilizzati i canali per database, non quando viene "
+"utilizzata\n"
+"                la configurazione dei canali a livello di server."
 
 #. module: queue_job
 #: model_terms:ir.ui.view,arch_db:queue_job.view_set_jobs_cancelled
@@ -887,6 +1114,19 @@ msgstr "I lavori selezionati verranno riaccodati."
 #: model_terms:ir.ui.view,arch_db:queue_job.view_set_jobs_done
 msgid "The selected jobs will be set to done."
 msgstr "I lavori selezionati verranno impostati a completato."
+
+#. module: queue_job
+#. odoo-python
+#: code:addons/queue_job/models/queue_job_channel.py:0
+msgid "The throttle of a channel cannot be negative."
+msgstr "La limitazione di frequenza di un canale non può essere negativa."
+
+#. module: queue_job
+#. odoo-javascript
+#: code:addons/queue_job/static/src/channel_tree/channel_tree.esm.js:0
+#: model:ir.model.fields,field_description:queue_job.field_queue_job_channel__throttle
+msgid "Throttle"
+msgstr "Limitazione frequenza"
 
 #. module: queue_job
 #: model_terms:ir.ui.view,arch_db:queue_job.view_queue_job_form
@@ -962,6 +1202,30 @@ msgstr "Procedura guidata per riaccodare una selezione di lavori"
 #: model:ir.model.fields,field_description:queue_job.field_queue_job__worker_pid
 msgid "Worker Pid"
 msgstr "PID worker"
+
+#. module: queue_job
+#. odoo-javascript
+#: code:addons/queue_job/static/src/channel_tree/channel_tree.esm.js:0
+msgid "inherited"
+msgstr "ereditato"
+
+#. module: queue_job
+#. odoo-javascript
+#: code:addons/queue_job/static/src/channel_tree/channel_tree.esm.js:0
+msgid "no"
+msgstr "no"
+
+#. module: queue_job
+#. odoo-javascript
+#: code:addons/queue_job/static/src/channel_tree/channel_tree.esm.js:0
+msgid "none"
+msgstr "nessuno"
+
+#. module: queue_job
+#. odoo-javascript
+#: code:addons/queue_job/static/src/channel_tree/channel_tree.esm.js:0
+msgid "yes"
+msgstr "sì"
 
 #~ msgid "If both parameters are 0, ALL jobs will be requeued!"
 #~ msgstr "Se entrambi i parametri sono 0, tutti i lavori verranno riaccodati!"
