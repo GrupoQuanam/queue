@@ -23,6 +23,7 @@ class TestGQJob(TransactionCase):
         super().setUp()
         self.calls = []
         self.side_effect = None
+        self.fail_ids = set()
         test = self
 
         def gq_probe(records, *args, **kwargs):
@@ -38,6 +39,8 @@ class TestGQJob(TransactionCase):
             )
             if test.side_effect:
                 raise test.side_effect
+            if test.fail_ids & set(records.ids):
+                raise ValueError("lote con error")
 
         partner_cls = type(self.env["res.partner"])
         for name in ("gq_probe", "_gq_probe"):
@@ -277,6 +280,130 @@ class TestGQJob(TransactionCase):
             job.with_user(self.user).action_cancel()
         with self.assertRaises(AccessError):
             job.with_user(self.user).action_requeue()
+
+    # ── Grupo y dependencias ──────────────────────────────────────────────────
+
+    def _partners(self, count):
+        return self.env["res.partner"].create(
+            [{"name": f"GQ {i}"} for i in range(count)]
+        )
+
+    def test_chunks_share_group(self):
+        jobs = self._partners(5).with_gq_delay(chunk_size=2).gq_probe()
+        self.assertTrue(jobs[0].group_uuid)
+        self.assertEqual(len(set(jobs.mapped("group_uuid"))), 1)
+        self.assertEqual(set(jobs.mapped("state")), {"pending"})
+        single = self.partner.with_gq_delay().gq_probe()
+        self.assertFalse(single.group_uuid)
+
+    def test_depends_on_forces_order(self):
+        first = self.partner.with_gq_delay(priority=50).gq_probe("first")
+        second = self.partner.with_gq_delay(priority=1, depends_on=first).gq_probe(
+            "second"
+        )
+        self.assertEqual(second.state, "waiting")
+        self.assertEqual(second.depends_on_ids, first)
+        self.assertTrue(first.group_uuid)
+        self.assertEqual(first.group_uuid, second.group_uuid)
+        self._run()
+        self.assertEqual((first.state, second.state), ("done", "done"))
+        self.assertEqual(
+            [call["args"] for call in self.calls], [("first",), ("second",)]
+        )
+
+    def test_depends_on_done_job_runs_at_once(self):
+        first = self.partner.with_gq_delay().gq_probe()
+        self._run()
+        second = self.partner.with_gq_delay(depends_on=first).gq_probe()
+        self.assertEqual(second.state, "pending")
+
+    def test_job_after_all_chunks(self):
+        jobs = self._partners(4).with_gq_delay(chunk_size=2).gq_probe("lote")
+        final = self.partner.with_gq_delay(priority=1, depends_on=jobs).gq_probe("fin")
+        self.assertEqual(final.state, "waiting")
+        self.assertEqual(final.group_uuid, jobs[0].group_uuid)
+        self._run()
+        self.assertEqual(final.state, "done")
+        self.assertEqual(self.calls[-1]["args"], ("fin",))
+        self.assertEqual(final.group_job_count, 3)
+        self.assertEqual(final.group_done_count, 3)
+
+    def test_failed_job_stops_group(self):
+        partners = self._partners(6)
+        jobs = partners.with_gq_delay(chunk_size=2).gq_probe()
+        final = self.partner.with_gq_delay(depends_on=jobs).gq_probe("fin")
+        outsider = self.partner.with_gq_delay().gq_probe("otro")
+        self.fail_ids = {partners[0].id}
+        self._run()
+        self.assertEqual(jobs[0].state, "failed")
+        self.assertEqual(
+            jobs[1:].mapped("state"),
+            ["waiting", "waiting"],
+            "El fallo de un job detiene los demas del grupo",
+        )
+        self.assertEqual(final.state, "waiting")
+        self.assertIn("Grupo detenido", jobs[1].result)
+        self.assertEqual(outsider.state, "done", "Jobs fuera del grupo siguen")
+
+        # Reencolar el fallido reanuda el grupo
+        self.fail_ids = set()
+        jobs[0].action_requeue()
+        self._run()
+        self.assertEqual(set(jobs.mapped("state")), {"done"})
+        self.assertEqual(final.state, "done")
+
+    def test_explicit_group(self):
+        a = self.partner.with_gq_delay(group="import-1").gq_probe("a")
+        b = self.partner.with_gq_delay(group="import-1").gq_probe("b")
+        self.assertEqual((a.state, b.state), ("pending", "pending"))
+        self.side_effect = ValueError("boom")
+        a._gq_process()
+        self.assertEqual((a.state, b.state), ("failed", "waiting"))
+        c = self.partner.with_gq_delay(group="import-1").gq_probe("c")
+        self.assertEqual(c.state, "waiting", "Un grupo detenido no admite jobs nuevos")
+
+    def test_cancel_failed_job_resumes_independent_jobs(self):
+        a = self.partner.with_gq_delay(group="g").gq_probe("a")
+        b = self.partner.with_gq_delay(group="g").gq_probe("b")
+        c = self.partner.with_gq_delay(depends_on=a).gq_probe("c")
+        self.side_effect = ValueError("boom")
+        a._gq_process()
+        self.side_effect = None
+        self.assertEqual((b.state, c.state), ("waiting", "waiting"))
+        a.action_cancel()
+        self.assertEqual(b.state, "pending")
+        self.assertEqual(c.state, "waiting", "Depende de un job cancelado")
+
+    def test_cancel_group(self):
+        partners = self._partners(4)
+        jobs = partners.with_gq_delay(chunk_size=2).gq_probe()
+        final = self.partner.with_gq_delay(depends_on=jobs).gq_probe()
+        self.fail_ids = {partners[0].id}
+        self._run()
+        jobs[0].action_cancel_group()
+        self.assertEqual(set((jobs | final).mapped("state")), {"cancelled"})
+        self._run()
+        self.assertEqual(len(self.calls), 1)
+
+    def test_orphan_failure_stops_group(self):
+        a = self.partner.with_gq_delay(group="g").gq_probe("a")
+        b = self.partner.with_gq_delay(group="g").gq_probe("b")
+        a.write(
+            {
+                "state": "started",
+                "date_started": fields.Datetime.now() - timedelta(minutes=5),
+                "retry_count": 6,
+            }
+        )
+        with patch.object(type(self.Job), "_gq_time_limit", lambda self: 120):
+            self.Job._gq_recover_started_jobs()
+        self.assertEqual((a.state, b.state), ("failed", "waiting"))
+
+    def test_requeue_waiting_job_is_rejected(self):
+        first = self.partner.with_gq_delay().gq_probe()
+        second = self.partner.with_gq_delay(depends_on=first).gq_probe()
+        with self.assertRaises(UserError):
+            second.action_requeue()
 
     # ── Limpieza ──────────────────────────────────────────────────────────────
 

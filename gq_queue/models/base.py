@@ -19,6 +19,8 @@ class Base(models.AbstractModel):
         channel="root",
         identity_key=None,
         chunk_size=None,
+        group=None,
+        depends_on=None,
     ):
         """Encola una llamada a metodo como gq.job para ejecucion en background.
 
@@ -33,6 +35,11 @@ class Base(models.AbstractModel):
                             encola otro y se retorna el existente.
         :param chunk_size:  Divide el recordset en lotes de este tamano y
                             encola un job por lote.
+        :param group:       Identificador de grupo. Si un job del grupo falla,
+                            los demas no se ejecutan hasta reencolarlo. Los
+                            lotes de ``chunk_size`` forman un grupo solos.
+        :param depends_on:  Recordset gq.job que debe terminar antes. El job
+                            nuevo se une al grupo de esos jobs.
         :returns: GQDelayable
 
         Ejemplo::
@@ -54,4 +61,6 @@ class Base(models.AbstractModel):
             channel=channel,
             identity_key=identity_key,
             chunk_size=chunk_size,
+            group=group,
+            depends_on=depends_on,
         )

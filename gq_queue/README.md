@@ -131,6 +131,9 @@ Tabla PostgreSQL: `gq_job`
 | `retry_count` | Integer | Número de intentos iniciados (se cuenta al pasar a `started`) |
 | `channel` | Char | Canal lógico (informativo). Default: `"root"` |
 | `identity_key` | Char | Clave de identidad: mientras haya un job pendiente con esta clave no se encola otro |
+| `group_uuid` | Char | Grupo del job. Si un job del grupo falla, los demás se detienen |
+| `depends_on_ids` | Many2many | Jobs que deben estar en `done` antes de ejecutar este |
+| `dependent_ids` | Many2many | Jobs que dependen de este |
 | `result` | Text | Mensaje de resultado (éxito o descripción del reintento) |
 | `exc_info` | Text | Traceback completo en caso de fallo |
 | `date_created` | Datetime | Fecha de creación del job |
@@ -169,6 +172,7 @@ Los jobs se toman de la cola ordenados por:
 
 | Estado | Descripción |
 |---|---|
+| `waiting` | En espera: tiene dependencias sin terminar o su grupo está detenido por un job fallido. |
 | `pending` | Esperando ser tomado por el runner. Estado inicial. |
 | `started` | Runner lo tomó y está ejecutando el método. Se confirma en BD antes de ejecutar. |
 | `done` | Método ejecutado correctamente. |
@@ -224,6 +228,8 @@ self.env["my.model"].with_gq_delay().some_model_method(param)
 | `channel` | str | `"root"` | Canal lógico del job (informativo). |
 | `identity_key` | str | `None` | Si ya hay un job **pendiente** con esta clave, no se encola otro y se retorna el existente. |
 | `chunk_size` | int | `None` | Divide el recordset en lotes de este tamaño y encola un job por lote. |
+| `group` | str | `None` | Identificador de grupo. Los lotes de `chunk_size` forman un grupo solos. |
+| `depends_on` | gq.job | `None` | Jobs que deben terminar antes. El job nuevo se une a su grupo. |
 
 `identity_key` y `chunk_size` no se pueden combinar.
 
@@ -242,6 +248,45 @@ invoices.with_gq_delay(chunk_size=100)._procesar()
 
 Cada lote es un job independiente: se reintenta y falla por separado. La llamada retorna el recordset con todos los jobs creados.
 
+### Grupos y dependencias
+
+Un **grupo** reúne varios jobs en un solo proceso. Reglas:
+
+- Si un job del grupo pasa a `failed`, **el grupo se detiene**: sus jobs `pending` pasan a
+  `waiting` y no se ejecutan. Los que ya están `started` terminan.
+- Reencolar el job fallido (**Requeue**) reanuda el grupo.
+- Un grupo detenido tampoco admite jobs nuevos: nacen en `waiting`.
+
+Una **dependencia** fuerza el orden: el job no se ejecuta hasta que todos los jobs de
+`depends_on` estén en `done`, sin importar la prioridad.
+
+```python
+# Lotes en paralelo: forman un grupo automáticamente
+lotes = facturas.with_gq_delay(chunk_size=100)._procesar()
+
+# Job final: corre solo cuando todos los lotes terminaron bien
+self.with_gq_delay(depends_on=lotes)._notificar_fin()
+
+# Orden forzado entre pasos
+paso1 = self.with_gq_delay()._exportar()
+paso2 = self.with_gq_delay(depends_on=paso1)._enviar()
+paso3 = self.with_gq_delay(depends_on=paso2)._archivar()
+
+# Grupo explícito para jobs encolados por separado
+self.with_gq_delay(group=f"import-{self.id}")._importar_hoja(1)
+self.with_gq_delay(group=f"import-{self.id}")._importar_hoja(2)
+```
+
+Grupo del job nuevo, por orden: el de `group`; el de sus dependencias (si no tienen, se crea
+uno y se les asigna); uno nuevo si `chunk_size` genera varios lotes. Con dependencias de
+grupos distintos el job no se une a ninguno.
+
+En el formulario del job, el botón **Group Done** muestra hechos / total y abre los jobs del
+grupo. **Cancel Group** cancela todos los jobs del grupo que no se han ejecutado.
+
+Cancelar solo el job fallido reanuda el resto del grupo, salvo los jobs que dependen del
+cancelado: esos quedan en `waiting`, porque una dependencia cancelada nunca llega a `done`.
+
 ### Evitar duplicados: clave de identidad
 
 ```python
@@ -249,7 +294,7 @@ Cada lote es un job independiente: se reintenta y falla por separado. La llamada
 self.with_gq_delay(identity_key=f"sync-partner-{self.id}")._sincronizar()
 ```
 
-Solo cuentan los jobs en `pending`. Un job ya iniciado no bloquea la clave, porque puede haber leído datos anteriores al nuevo encolado.
+Solo cuentan los jobs en `pending` o `waiting`. Un job ya iniciado no bloquea la clave, porque puede haber leído datos anteriores al nuevo encolado.
 
 ---
 
@@ -403,6 +448,7 @@ _gq_cron_trigger(at=eta_datetime)
 ```python
 def _gq_job_runner(self, commit=True, max_seconds=None):
     self._gq_recover_started_jobs()    # reencola o falla jobs huérfanos
+    self._gq_release_waiting()         # libera jobs con dependencias ya cumplidas
     job = self._gq_acquire_one_job()   # SQL SELECT ... FOR NO KEY UPDATE SKIP LOCKED
     while job:
         job._gq_process(commit=commit) # ejecuta + actualiza estado
@@ -533,8 +579,9 @@ sistema `gq_queue.keep_done_days` (`0` = no borrar).
 En **GQ Queue → Jobs** (solo `base.group_system`), desde el formulario o seleccionando
 varios en la lista:
 
-- **Requeue**: vuelve a `pending` un job `failed`, `cancelled` o `done` y reinicia sus intentos.
-- **Cancel**: cancela un job `pending` o `failed`. Un job `started` no se puede cancelar.
+- **Requeue**: vuelve a encolar un job `failed`, `cancelled` o `done` y reinicia sus intentos. Pasa a `pending`, o queda en `waiting` si tiene dependencias sin terminar o su grupo sigue detenido.
+- **Cancel**: cancela un job `waiting`, `pending` o `failed`. Un job `started` no se puede cancelar.
+- **Cancel Group**: cancela todos los jobs no ejecutados del grupo.
 
 ### Permisos
 
@@ -555,7 +602,9 @@ No se requieren variables de entorno adicionales.
 | Método | Descripción |
 |---|---|
 | `action_requeue()` | Vuelve a encolar jobs terminados y reinicia sus intentos |
-| `action_cancel()` | Cancela jobs pendientes o fallidos |
+| `action_cancel()` | Cancela jobs en espera, pendientes o fallidos |
+| `action_cancel_group()` | Cancela todos los jobs no ejecutados del grupo |
+| `_gq_release_waiting()` | Pasa a `pending` los jobs en `waiting` que ya pueden ejecutarse |
 | `_gq_job_runner(commit=True, max_seconds=None)` | Entry point del cron. Procesa la cola dentro del presupuesto de tiempo. |
 | `_gq_cron_trigger(at=None)` | Dispara todos los crons `gq_job_runner`. |
 
@@ -596,6 +645,7 @@ raise GQNothingToDoJob("mensaje")
 
 | Limitación | Detalle |
 |---|---|
+| **Sin cadenas declarativas** | No hay `chain()` ni `group()` como en `queue_job`; el orden se arma con `depends_on`. |
 | **Sin gestión de canales** | El campo `channel` es informativo. No hay control de capacidad por canal. |
 | **Job más largo que el margen** | Un job que dura más que la mitad del límite de tiempo del servidor puede ser interrumpido. Se reintenta como huérfano hasta agotar intentos. Dividirlo en jobs más chicos. |
 | **Sin `cr.commit()` en jobs** | El commit dentro de la función encolada suelta el bloqueo de la fila (ver sección 10, *Jobs huérfanos*). |

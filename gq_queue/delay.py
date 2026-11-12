@@ -1,5 +1,6 @@
 import json
 import logging
+import uuid
 from datetime import date, datetime
 
 _logger = logging.getLogger(__name__)
@@ -55,9 +56,13 @@ class GQDelayable:
         channel="root",
         identity_key=None,
         chunk_size=None,
+        group=None,
+        depends_on=None,
     ):
         if identity_key and chunk_size:
             raise ValueError("identity_key y chunk_size no se pueden combinar")
+        self._group = group
+        self._depends_on = depends_on
         self._recordset = recordset
         self._priority = priority
         self._eta = eta
@@ -74,6 +79,26 @@ class GQDelayable:
         if not size or len(records) <= size:
             return [records]
         return [records[i : i + size] for i in range(0, len(records), size)]
+
+    def _gq_group(self, depends_on, chunk_count):
+        """Grupo de los jobs a crear.
+
+        Por orden: el indicado en ``group``, el de las dependencias (si no
+        tienen, se crea uno y se les asigna) o uno nuevo para varios lotes.
+        """
+        if self._group:
+            return self._group
+        if depends_on:
+            groups = set(depends_on.mapped("group_uuid"))
+            if len(groups) > 1:
+                # Dependencias de grupos distintos: el job no se une a ninguno
+                return None
+            group = groups.pop() or str(uuid.uuid4())
+            depends_on.filtered(lambda job: not job.group_uuid).group_uuid = group
+            return group
+        if chunk_count > 1:
+            return str(uuid.uuid4())
+        return None
 
     def __getattr__(self, name):
         # Los nombres especiales (__deepcopy__, __getstate__, ...) los consulta
@@ -94,7 +119,7 @@ class GQDelayable:
                 existing = Job.search(
                     [
                         ("identity_key", "=", self._identity_key),
-                        ("state", "=", "pending"),
+                        ("state", "in", ("waiting", "pending")),
                     ],
                     limit=1,
                 )
@@ -131,6 +156,16 @@ class GQDelayable:
                 "eta": self._eta or False,
             }
             chunks = self._chunks()
+            depends_on = Job.browse(self._depends_on.ids if self._depends_on else [])
+            group = self._gq_group(depends_on, len(chunks))
+            if group or depends_on:
+                # Nace en espera: _gq_release_waiting lo pasa a 'pending' si sus
+                # dependencias estan hechas y su grupo no tiene un job fallido.
+                common.update(
+                    state="waiting",
+                    group_uuid=group or False,
+                    depends_on_ids=[(6, 0, depends_on.ids)],
+                )
             vals_list = []
             for index, chunk in enumerate(chunks, start=1):
                 chunk_name = description
@@ -141,6 +176,11 @@ class GQDelayable:
                 )
 
             jobs = Job.create(vals_list)
+            if group or depends_on:
+                Job._gq_release_waiting()
+                # Un job que sigue en espera tambien despierta al runner: si su
+                # dependencia termino mientras se encolaba, el runner lo libera.
+                Job._gq_cron_trigger()
             _logger.debug(
                 "GQ enqueued job(s) %s: %s.%s", jobs.ids, recordset._name, name
             )

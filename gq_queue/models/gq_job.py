@@ -26,6 +26,7 @@ ORPHAN_MAX_ATTEMPTS = 5
 # Dias que se conservan los jobs terminados (parametro gq_queue.keep_done_days)
 DEFAULT_KEEP_DONE_DAYS = 30
 
+GQ_WAITING = "waiting"
 GQ_PENDING = "pending"
 GQ_STARTED = "started"
 GQ_DONE = "done"
@@ -103,6 +104,7 @@ class GQJob(models.Model):
 
     state = fields.Selection(
         selection=[
+            (GQ_WAITING, "Waiting"),
             (GQ_PENDING, "Pending"),
             (GQ_STARTED, "Started"),
             (GQ_DONE, "Done"),
@@ -150,6 +152,42 @@ class GQJob(models.Model):
         help="Mientras haya un job pendiente con esta clave no se encola otro igual.",
     )
 
+    # ── Grupo y dependencias ──────────────────────────────────────────────────
+
+    group_uuid = fields.Char(
+        string="Group",
+        readonly=True,
+        index=True,
+        copy=False,
+        help="Jobs que forman un mismo proceso. Si uno falla, el grupo se detiene: "
+        "sus jobs pendientes pasan a 'waiting' hasta reencolar el fallido.",
+    )
+    depends_on_ids = fields.Many2many(
+        "gq.job",
+        relation="gq_job_dependency_rel",
+        column1="job_id",
+        column2="depends_on_id",
+        string="Depends On",
+        readonly=True,
+        copy=False,
+        help="El job no se ejecuta hasta que todos estos jobs esten en 'done'.",
+    )
+    dependent_ids = fields.Many2many(
+        "gq.job",
+        relation="gq_job_dependency_rel",
+        column1="depends_on_id",
+        column2="job_id",
+        string="Dependent Jobs",
+        readonly=True,
+        copy=False,
+    )
+    group_job_count = fields.Integer(
+        string="Jobs in Group", compute="_compute_group_progress"
+    )
+    group_done_count = fields.Integer(
+        string="Done in Group", compute="_compute_group_progress"
+    )
+
     # ── Resultado ─────────────────────────────────────────────────────────────
 
     result = fields.Text(string="Result", readonly=True)
@@ -176,6 +214,24 @@ class GQJob(models.Model):
             """
         )
 
+    @api.depends("group_uuid", "state")
+    def _compute_group_progress(self):
+        groups = [uuid for uuid in set(self.mapped("group_uuid")) if uuid]
+        totals = {}
+        if groups:
+            rows = self.sudo()._read_group(
+                [("group_uuid", "in", groups)], ["group_uuid", "state"], ["__count"]
+            )
+            for group_uuid, state, count in rows:
+                total = totals.setdefault(group_uuid, [0, 0])
+                total[0] += count
+                if state == GQ_DONE:
+                    total[1] += count
+        for job in self:
+            job.group_job_count, job.group_done_count = totals.get(
+                job.group_uuid, (0, 0)
+            )
+
     # ── Maquina de estados ────────────────────────────────────────────────────
 
     def _gq_set_started(self):
@@ -199,6 +255,7 @@ class GQJob(models.Model):
         if exc_info:
             vals["exc_info"] = exc_info
         self.sudo().write(vals)
+        self._gq_stop_group()
 
     def _gq_set_cancelled(self):
         self.sudo().write(
@@ -223,15 +280,21 @@ class GQJob(models.Model):
     # ── Acciones de usuario ───────────────────────────────────────────────────
 
     def action_requeue(self):
-        """Vuelve a encolar jobs terminados (fallidos, cancelados o hechos)."""
+        """Vuelve a encolar jobs terminados (fallidos, cancelados o hechos).
+
+        El job queda en 'waiting' y pasa a 'pending' si sus dependencias estan
+        hechas y su grupo no tiene otro job fallido.
+        """
         self.check_access("write")
-        if self.filtered(lambda job: job.state in (GQ_PENDING, GQ_STARTED)):
+        if self.filtered(
+            lambda job: job.state in (GQ_WAITING, GQ_PENDING, GQ_STARTED)
+        ):
             raise UserError(
                 _("Only failed, cancelled or done jobs can be requeued.")
             )
         self.sudo().write(
             {
-                "state": GQ_PENDING,
+                "state": GQ_WAITING,
                 "retry_count": 0,
                 "eta": False,
                 "result": False,
@@ -240,17 +303,121 @@ class GQJob(models.Model):
                 "date_done": False,
             }
         )
+        self._gq_release_waiting()
         return True
 
     def action_cancel(self):
-        """Cancela jobs que no estan en ejecucion."""
+        """Cancela jobs que no estan en ejecucion.
+
+        Cancelar el job fallido de un grupo reanuda el resto del grupo, salvo
+        los jobs que dependen del cancelado. Para abortar todo el grupo usar
+        ``action_cancel_group``.
+        """
         self.check_access("write")
         if self.filtered(lambda job: job.state == GQ_STARTED):
             raise UserError(_("A running job cannot be cancelled."))
         self.filtered(
-            lambda job: job.state in (GQ_PENDING, GQ_FAILED)
+            lambda job: job.state in (GQ_WAITING, GQ_PENDING, GQ_FAILED)
+        )._gq_set_cancelled()
+        self._gq_release_waiting()
+        return True
+
+    def action_cancel_group(self):
+        """Cancela todos los jobs no ejecutados de los grupos de estos jobs."""
+        self.check_access("write")
+        groups = [uuid for uuid in set(self.mapped("group_uuid")) if uuid]
+        jobs = self | self.sudo().search([("group_uuid", "in", groups)])
+        jobs.filtered(
+            lambda job: job.state in (GQ_WAITING, GQ_PENDING, GQ_FAILED)
         )._gq_set_cancelled()
         return True
+
+    def action_view_group(self):
+        self.ensure_one()
+        return {
+            "type": "ir.actions.act_window",
+            "name": _("Group Jobs"),
+            "res_model": "gq.job",
+            "view_mode": "list,form",
+            "domain": [("group_uuid", "=", self.group_uuid)],
+        }
+
+    # ── Grupo y dependencias ──────────────────────────────────────────────────
+
+    def _gq_stop_group(self):
+        """Detiene los grupos de estos jobs fallidos.
+
+        Los jobs pendientes del grupo pasan a 'waiting'; los que ya estan en
+        ejecucion terminan. SKIP LOCKED deja fuera a los que otro runner esta
+        tomando en este momento.
+        """
+        groups = [uuid for uuid in set(self.mapped("group_uuid")) if uuid]
+        if not groups:
+            return
+        self.env.flush_all()
+        self.env.cr.execute(
+            """
+            UPDATE gq_job
+            SET state = 'waiting', result = %s
+            WHERE id IN (
+                SELECT id FROM gq_job
+                WHERE group_uuid = ANY(%s) AND state = 'pending'
+                FOR NO KEY UPDATE SKIP LOCKED
+            )
+            RETURNING id
+            """,
+            ("Grupo detenido: fallo el job %s" % self.ids, groups),
+        )
+        rows = self.env.cr.fetchall()
+        if rows:
+            self.invalidate_model(["state", "result"])
+            _logger.warning(
+                "GQ Queue: grupo(s) %s detenido(s) por fallo de %s; %d job(s) en espera",
+                groups,
+                self.ids,
+                len(rows),
+            )
+
+    @api.model
+    def _gq_release_waiting(self):
+        """Pasa a 'pending' los jobs en 'waiting' que ya pueden ejecutarse.
+
+        Un job puede ejecutarse cuando todas sus dependencias estan en 'done'
+        y su grupo no tiene ningun job en 'failed'.
+
+        :returns: recordset de jobs liberados.
+        """
+        self.env.flush_all()
+        self.env.cr.execute(
+            """
+            UPDATE gq_job
+            SET state = 'pending'
+            WHERE id IN (
+                SELECT j.id FROM gq_job j
+                WHERE j.state = 'waiting'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM gq_job_dependency_rel r
+                      JOIN gq_job d ON d.id = r.depends_on_id
+                      WHERE r.job_id = j.id AND d.state != 'done'
+                  )
+                  AND (
+                      j.group_uuid IS NULL
+                      OR NOT EXISTS (
+                          SELECT 1 FROM gq_job f
+                          WHERE f.group_uuid = j.group_uuid AND f.state = 'failed'
+                      )
+                  )
+                FOR NO KEY UPDATE OF j SKIP LOCKED
+            )
+            RETURNING id
+            """
+        )
+        released = self.browse([row[0] for row in self.env.cr.fetchall()])
+        if released:
+            self.invalidate_model(["state"])
+            released._gq_ensure_cron_trigger()
+        return released
 
     # ── Ejecucion ─────────────────────────────────────────────────────────────
 
@@ -415,7 +582,7 @@ class GQJob(models.Model):
                     )
                   FOR NO KEY UPDATE SKIP LOCKED
               )
-            RETURNING id
+            RETURNING id, state
             """,
             {
                 "cap": ORPHAN_MAX_ATTEMPTS,
@@ -428,6 +595,9 @@ class GQJob(models.Model):
         if rows:
             ids = [r[0] for r in rows]
             self.invalidate_model(["state", "exc_info", "date_done"])
+            self.browse(
+                [r[0] for r in rows if r[1] == GQ_FAILED]
+            )._gq_stop_group()
             _logger.warning(
                 "GQ Queue: %d job(s) huerfano(s) recuperado(s): %s", len(ids), ids
             )
@@ -492,6 +662,7 @@ class GQJob(models.Model):
         deadline = fields.Datetime.now() + timedelta(seconds=max_seconds)
         _logger.debug("GQ Job Runner started (deadline en %ds)", max_seconds)
         self._gq_recover_started_jobs()
+        self._gq_release_waiting()
         job = self._gq_acquire_one_job()
         processed = 0
         while job:
@@ -507,6 +678,7 @@ class GQJob(models.Model):
                 )
                 self._gq_cron_trigger()
                 break
+            self._gq_release_waiting()
             job = self._gq_acquire_one_job()
         _logger.debug("GQ Job Runner finished (%d jobs processed)", processed)
 

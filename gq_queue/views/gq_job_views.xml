@@ -10,7 +10,8 @@
             <list decoration-danger="state == 'failed'"
                   decoration-muted="state == 'cancelled'"
                   decoration-success="state == 'done'"
-                  decoration-warning="state == 'started'">
+                  decoration-warning="state == 'started'"
+                  decoration-info="state == 'waiting'">
                 <header>
                     <button name="action_requeue" type="object" string="Requeue"/>
                     <button name="action_cancel" type="object" string="Cancel"/>
@@ -21,6 +22,7 @@
                 <field name="state"/>
                 <field name="priority"/>
                 <field name="channel"/>
+                <field name="group_uuid" optional="hide"/>
                 <field name="user_id" optional="show"/>
                 <field name="company_id" optional="hide" groups="base.group_multi_company"/>
                 <field name="eta"/>
@@ -43,17 +45,33 @@
                             class="oe_highlight"
                             invisible="state not in ('failed', 'cancelled', 'done')"/>
                     <button name="action_cancel" type="object" string="Cancel"
-                            invisible="state not in ('pending', 'failed')"/>
+                            invisible="state not in ('waiting', 'pending', 'failed')"/>
+                    <button name="action_cancel_group" type="object" string="Cancel Group"
+                            invisible="not group_uuid"
+                            confirm="Cancel every job of this group that has not run yet?"/>
                     <field name="state" widget="statusbar"
-                           statusbar_visible="pending,started,done,failed"/>
+                           statusbar_visible="waiting,pending,started,done,failed"/>
                 </header>
                 <sheet>
+                    <div class="oe_button_box" name="button_box" invisible="not group_uuid">
+                        <button name="action_view_group" type="object"
+                                class="oe_stat_button" icon="fa-tasks">
+                            <div class="o_field_widget o_stat_info">
+                                <span class="o_stat_value">
+                                    <field name="group_done_count"/> /
+                                    <field name="group_job_count"/>
+                                </span>
+                                <span class="o_stat_text">Group Done</span>
+                            </div>
+                        </button>
+                    </div>
                     <group>
                         <group string="Job">
                             <field name="name"/>
                             <field name="uuid"/>
                             <field name="channel"/>
                             <field name="identity_key"/>
+                            <field name="group_uuid"/>
                             <field name="priority"/>
                         </group>
                         <group string="Execution">
@@ -76,6 +94,24 @@
                                 <field name="record_ids"/>
                                 <field name="args"/>
                                 <field name="kwargs"/>
+                            </group>
+                        </page>
+                        <page string="Dependencies">
+                            <group string="Depends On">
+                                <field name="depends_on_ids" nolabel="1" colspan="2">
+                                    <list>
+                                        <field name="name"/>
+                                        <field name="state"/>
+                                    </list>
+                                </field>
+                            </group>
+                            <group string="Dependent Jobs">
+                                <field name="dependent_ids" nolabel="1" colspan="2">
+                                    <list>
+                                        <field name="name"/>
+                                        <field name="state"/>
+                                    </list>
+                                </field>
                             </group>
                         </page>
                         <page string="Result">
@@ -109,6 +145,9 @@
                 <field name="name"/>
                 <field name="model_name"/>
                 <field name="method_name"/>
+                <field name="group_uuid"/>
+                <filter name="waiting" string="Waiting"
+                        domain="[('state','=','waiting')]"/>
                 <filter name="pending" string="Pending"
                         domain="[('state','=','pending')]"/>
                 <filter name="started" string="Running"
@@ -125,6 +164,8 @@
                             context="{'group_by': 'state'}"/>
                     <filter name="group_model" string="Model"
                             context="{'group_by': 'model_name'}"/>
+                    <filter name="group_group" string="Group"
+                            context="{'group_by': 'group_uuid'}"/>
                     <filter name="group_channel" string="Channel"
                             context="{'group_by': 'channel'}"/>
                 </group>
