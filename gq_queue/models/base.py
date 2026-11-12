@@ -16,7 +16,6 @@ class Base(models.AbstractModel):
         eta=None,
         description=None,
         max_retries=DEFAULT_MAX_RETRIES,
-        channel="root",
         identity_key=None,
         chunk_size=None,
         group=None,
@@ -30,7 +29,6 @@ class Base(models.AbstractModel):
         :param eta:         datetime UTC; no ejecutar antes de esta hora.
         :param description: Descripcion visible en la UI de GQ Queue.
         :param max_retries: Reintentos maximos ante GQRetryableJobError. 0 = sin limite.
-        :param channel:     Canal logico (informativo). Default: 'root'.
         :param identity_key: Si ya hay un job pendiente con esta clave, no se
                             encola otro y se retorna el existente.
         :param chunk_size:  Divide el recordset en lotes de este tamano y
@@ -58,7 +56,6 @@ class Base(models.AbstractModel):
             eta=eta,
             description=description,
             max_retries=max_retries,
-            channel=channel,
             identity_key=identity_key,
             chunk_size=chunk_size,
             group=group,

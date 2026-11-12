@@ -3,6 +3,8 @@ import logging
 import uuid
 from datetime import date, datetime
 
+from odoo import models
+
 _logger = logging.getLogger(__name__)
 
 DEFAULT_PRIORITY = 10
@@ -15,6 +17,13 @@ class GQJobEncoder(json.JSONEncoder):
     """Encoder JSON que soporta tipos comunes de Odoo."""
 
     def default(self, obj):
+        if isinstance(obj, models.BaseModel):
+            return {
+                "__gqtype__": "recordset",
+                "model": obj._name,
+                "ids": obj.ids,
+                "su": obj.env.su,
+            }
         if isinstance(obj, datetime):
             return {"__gqtype__": "datetime", "value": obj.isoformat()}
         if isinstance(obj, date):
@@ -22,10 +31,16 @@ class GQJobEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
-def gq_job_decoder(dct):
-    """Object hook para decodificar tipos especiales al deserializar args/kwargs."""
+def gq_job_decoder(dct, env):
+    """Object hook para decodificar tipos especiales al deserializar args/kwargs.
+
+    :param env: entorno del job, necesario para reconstruir recordsets.
+    """
     if "__gqtype__" in dct:
         t = dct["__gqtype__"]
+        if t == "recordset":
+            records = env[dct["model"]].browse(dct["ids"])
+            return records.sudo() if dct.get("su") else records
         if t == "datetime":
             return datetime.fromisoformat(dct["value"])
         if t == "date":
@@ -53,7 +68,6 @@ class GQDelayable:
         eta=None,
         description=None,
         max_retries=DEFAULT_MAX_RETRIES,
-        channel="root",
         identity_key=None,
         chunk_size=None,
         group=None,
@@ -68,7 +82,6 @@ class GQDelayable:
         self._eta = eta
         self._description = description
         self._max_retries = max_retries
-        self._channel = channel
         self._identity_key = identity_key
         self._chunk_size = chunk_size
 
@@ -150,7 +163,6 @@ class GQDelayable:
                 "kwargs": json.dumps(kwargs, cls=GQJobEncoder),
                 "priority": self._priority,
                 "max_retries": self._max_retries,
-                "channel": self._channel or "root",
                 "identity_key": self._identity_key or False,
                 "state": "pending",
                 "eta": self._eta or False,

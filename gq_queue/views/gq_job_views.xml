@@ -21,12 +21,13 @@
                 <field name="method_name"/>
                 <field name="state"/>
                 <field name="priority"/>
-                <field name="channel"/>
                 <field name="group_uuid" optional="hide"/>
                 <field name="user_id" optional="show"/>
                 <field name="company_id" optional="hide" groups="base.group_multi_company"/>
                 <field name="eta"/>
                 <field name="retry_count"/>
+                <field name="exc_name" optional="hide"/>
+                <field name="exec_time" optional="hide"/>
                 <field name="date_created"/>
                 <field name="date_done"/>
             </list>
@@ -69,7 +70,6 @@
                         <group string="Job">
                             <field name="name"/>
                             <field name="uuid"/>
-                            <field name="channel"/>
                             <field name="identity_key"/>
                             <field name="group_uuid"/>
                             <field name="priority"/>
@@ -119,6 +119,8 @@
                                 <field name="result"/>
                             </group>
                             <group>
+                                <field name="exc_name"/>
+                                <field name="exc_message"/>
                                 <field name="exc_info" widget="text"/>
                             </group>
                         </page>
@@ -127,6 +129,9 @@
                                 <field name="date_created"/>
                                 <field name="date_started"/>
                                 <field name="date_done"/>
+                                <field name="date_cancelled"/>
+                                <field name="exec_time"/>
+                                <field name="worker_pid"/>
                             </group>
                         </page>
                     </notebook>
@@ -146,6 +151,8 @@
                 <field name="model_name"/>
                 <field name="method_name"/>
                 <field name="group_uuid"/>
+                <field name="exc_name"/>
+                <field name="exc_message"/>
                 <filter name="waiting" string="Waiting"
                         domain="[('state','=','waiting')]"/>
                 <filter name="pending" string="Pending"
@@ -164,10 +171,10 @@
                             context="{'group_by': 'state'}"/>
                     <filter name="group_model" string="Model"
                             context="{'group_by': 'model_name'}"/>
+                    <filter name="group_exception" string="Exception"
+                            context="{'group_by': 'exc_name'}"/>
                     <filter name="group_group" string="Group"
                             context="{'group_by': 'group_uuid'}"/>
-                    <filter name="group_channel" string="Channel"
-                            context="{'group_by': 'channel'}"/>
                 </group>
             </search>
         </field>

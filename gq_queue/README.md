@@ -91,6 +91,7 @@ gq_queue/
 │   ├── __init__.py
 │   ├── base.py                # Extiende 'base': agrega with_gq_delay() a todos los modelos
 │   ├── gq_job.py              # Modelo gq.job + runner completo
+│   ├── gq_job_function.py     # Configuración por función (reintentos, on_fail)
 │   └── ir_cron.py             # Agrega campo gq_job_runner a ir.cron
 ├── security/
 │   └── ir.model.access.csv
@@ -100,6 +101,7 @@ gq_queue/
 │   └── ir_cron.xml            # Cron "GQ Queue Job Runner"
 └── views/
     ├── gq_job_views.xml       # Vistas list, form, search y menú
+    ├── gq_job_function_views.xml
     └── ir_cron_views.xml      # Agrega campo gq_job_runner al form de ir.cron
 ```
 
@@ -129,16 +131,20 @@ Tabla PostgreSQL: `gq_job`
 | `eta` | Datetime | No ejecutar antes de esta fecha/hora UTC |
 | `max_retries` | Integer | Máximo de reintentos en error retryable. `0` = sin límite. Default: `5` |
 | `retry_count` | Integer | Número de intentos iniciados (se cuenta al pasar a `started`) |
-| `channel` | Char | Canal lógico (informativo). Default: `"root"` |
 | `identity_key` | Char | Clave de identidad: mientras haya un job pendiente con esta clave no se encola otro |
 | `group_uuid` | Char | Grupo del job. Si un job del grupo falla, los demás se detienen |
 | `depends_on_ids` | Many2many | Jobs que deben estar en `done` antes de ejecutar este |
 | `dependent_ids` | Many2many | Jobs que dependen de este |
 | `result` | Text | Mensaje de resultado (éxito o descripción del reintento) |
+| `exc_name` | Char | Clase de la excepción que causó el fallo, p.ej. `ValueError` |
+| `exc_message` | Char | Mensaje de la excepción |
 | `exc_info` | Text | Traceback completo en caso de fallo |
+| `exec_time` | Float | Segundos que tomó el último intento |
+| `worker_pid` | Integer | Proceso que ejecutó el último intento |
 | `date_created` | Datetime | Fecha de creación del job |
 | `date_started` | Datetime | Fecha en que el runner comenzó a ejecutarlo |
 | `date_done` | Datetime | Fecha de finalización (done, failed o cancelled) |
+| `date_cancelled` | Datetime | Fecha de cancelación |
 
 ### Orden de procesamiento
 
@@ -226,7 +232,6 @@ self.env["my.model"].with_gq_delay().some_model_method(param)
 | `eta` | datetime | `None` | No ejecutar antes de esta fecha/hora (UTC). |
 | `description` | str | Auto | Descripción del job visible en la UI. |
 | `max_retries` | int | `5` | Reintentos máximos ante `GQRetryableJobError`. `0` = sin límite. |
-| `channel` | str | `"root"` | Canal lógico del job (informativo). |
 | `identity_key` | str | `None` | Si ya hay un job **pendiente** con esta clave, no se encola otro y se retorna el existente. |
 | `chunk_size` | int | `None` | Divide el recordset en lotes de este tamaño y encola un job por lote. |
 | `group` | str | `None` | Identificador de grupo. Los lotes de `chunk_size` forman un grupo solos. |
@@ -334,20 +339,19 @@ Los argumentos del método se serializan a JSON al crear el job y se deserializa
 | `datetime` | `{"__gqtype__": "datetime", "value": "2026-05-15T10:30:00"}` |
 | `date` | `{"__gqtype__": "date", "value": "2026-05-15"}` |
 
-### Tipos NO soportados
+| recordset | `{"__gqtype__": "recordset", "model": "res.partner", "ids": [1, 2], "su": false}` |
 
-Los recordsets de Odoo no se serializan automáticamente. Si necesitas pasar un recordset como argumento, usa sus IDs:
+### Recordsets como argumentos
 
 ```python
-# ❌ No funciona
-record.with_gq_delay().mi_metodo(other_record)
-
-# ✅ Correcto: pasar IDs y re-browse dentro del método
-record.with_gq_delay().mi_metodo(other_record.ids)
-
-def mi_metodo(self, other_ids):
-    other = self.env["other.model"].browse(other_ids)
+record.with_gq_delay()._mi_funcion(otros_registros, cliente=partner)
 ```
+
+Se guardan modelo e ids. Al ejecutar se reconstruyen en el entorno del job (usuario y
+contexto de quien encoló), conservando el modo `sudo()` del argumento. Un registro borrado
+antes de ejecutar da error al leerlo: usar `.exists()` si eso es posible.
+
+Cualquier otro tipo no serializable lanza `TypeError` al encolar.
 
 ---
 
@@ -376,6 +380,15 @@ def mi_metodo(self):
     if servicio_externo_caido():
         # Reintenta en 10 minutos
         raise GQRetryableJobError("API no disponible", seconds=600)
+```
+
+Espera antes del reintento, por orden: `seconds` del error; el patrón de reintentos
+configurado para la función (ver sección 9.1); 5 segundos.
+
+```python
+# No consume intentos: el job puede reintentar sin límite.
+# Usar solo cuando la condición de espera termina con seguridad.
+raise GQRetryableJobError("Esperando cierre de caja", seconds=60, ignore_retry=True)
 ```
 
 **Comportamiento:**
@@ -407,6 +420,60 @@ def mi_metodo(self):
 ### Excepciones no controladas
 
 Cualquier otra excepción (`ValueError`, `KeyError`, etc.) causa que el job pase a `failed` con el traceback completo guardado en `exc_info`.
+
+El job guarda la clase y el mensaje de la excepción en `exc_name` y `exc_message`, para
+filtrar y agrupar fallos en la lista.
+
+### 9.1 Configuración por función
+
+En **GQ Queue → Job Functions** se configura, por modelo y función:
+
+| Campo | Efecto |
+|---|---|
+| `retry_pattern` | Espera según el número de intento, ante errores reintentables sin `seconds`. |
+| `on_fail_method` | Función del modelo que se llama cuando el job falla definitivamente. |
+
+Sin registro para una función, sus jobs usan los valores por defecto.
+
+**Patrón de reintentos.** Diccionario `{intento: segundos}`. Aplica la entrada más alta que
+no supere el intento actual; antes de la primera entrada, 5 segundos. Un par `(min, max)`
+elige la espera al azar en ese rango, para no reintentar todos los jobs a la vez.
+
+```python
+{1: 10, 5: 60, 10: 300}        # intentos 1-4: 10 s; 5-9: 60 s; 10+: 300 s
+{1: (1, 10), 5: (30, 60)}      # espera aleatoria por tramo
+```
+
+**Función `on_fail`.** Se llama sobre el recordset del job cuando pasa a `failed` (error no
+reintentable, reintentos agotados o worker muerto), no en cada reintento:
+
+```python
+def _al_fallar_sync(self, exc_name, exc_message, exc_info):
+    self.write({"sync_state": "error", "sync_error": exc_message})
+```
+
+Un error dentro de `on_fail` se registra en el log y no se propaga: el runner sigue con el
+siguiente job.
+
+También por datos XML, desde el módulo que define la función:
+
+```xml
+<record id="job_function_sync" model="gq.job.function">
+    <field name="model_id" ref="model_mi_modelo"/>
+    <field name="method">_sincronizar</field>
+    <field name="retry_pattern">{1: 10, 5: 60, 10: 300}</field>
+    <field name="on_fail_method">_al_fallar_sync</field>
+</record>
+```
+
+### 9.2 Saber en qué job corre la función
+
+Durante la ejecución, el contexto incluye `job_uuid`:
+
+```python
+def _procesar(self):
+    job = self.env["gq.job"].sudo().search([("uuid", "=", self.env.context["job_uuid"])])
+```
 
 ### Errores de concurrencia PostgreSQL
 
@@ -617,7 +684,7 @@ Clase proxy usada internamente por `with_gq_delay()`. También puede instanciars
 from odoo.addons.gq_queue.delay import GQDelayable
 
 GQDelayable(recordset, priority=10, eta=None, description=None, max_retries=5,
-            channel="root", identity_key=None, chunk_size=None)
+            identity_key=None, chunk_size=None, group=None, depends_on=None)
 ```
 
 Al llamar cualquier función sobre el proxy, crea y retorna el `gq.job` (varios con `chunk_size`):
@@ -633,6 +700,9 @@ job = self.env["sale.order"].browse([1]).with_gq_delay().action_confirm()
 # Reintenta en N segundos
 raise GQRetryableJobError("mensaje", seconds=60)
 
+# Reintenta sin consumir un intento
+raise GQRetryableJobError("mensaje", ignore_retry=True)
+
 # Falla definitiva
 raise GQFailedJobError("mensaje")
 
@@ -647,8 +717,6 @@ raise GQNothingToDoJob("mensaje")
 | Limitación | Detalle |
 |---|---|
 | **Sin cadenas declarativas** | No hay `chain()` ni `group()` como en `queue_job`; el orden se arma con `depends_on`. |
-| **Sin gestión de canales** | El campo `channel` es informativo. No hay control de capacidad por canal. |
+| **Sin canales** | No hay canales ni control de capacidad como en `queue_job`. El paralelismo lo da el número de crons runner. |
 | **Job más largo que el margen** | Un job que dura más que la mitad del límite de tiempo del servidor puede ser interrumpido. Se reintenta como huérfano hasta agotar intentos. Dividirlo en jobs más chicos. |
 | **Sin `cr.commit()` en jobs** | El commit dentro de la función encolada suelta el bloqueo de la fila (ver sección 10, *Jobs huérfanos*). |
-| **Recordsets no serializables** | No se pueden pasar recordsets como args/kwargs. Usar IDs. |
-| **Sin prioridad por canal** | La selección de jobs es global por `priority` + `date_created`, sin considerar canales. |

@@ -1,7 +1,10 @@
 import json
 import logging
+import os
+import random
 import traceback
 from datetime import timedelta
+from functools import partial
 from io import StringIO
 
 from psycopg2 import OperationalError
@@ -11,13 +14,15 @@ from odoo.exceptions import UserError
 from odoo.service.model import PG_CONCURRENCY_ERRORS_TO_RETRY
 from odoo.tools import config
 
-from ..delay import GQJobEncoder, gq_job_decoder
+from ..delay import gq_job_decoder
 from ..exception import GQFailedJobError, GQNothingToDoJob, GQRetryableJobError
 
 _logger = logging.getLogger(__name__)
 
 # Segundos a esperar tras un error de concurrencia de PostgreSQL
 PG_RETRY = 5
+# Segundos a esperar ante un error reintentable sin espera propia ni patron
+RETRY_INTERVAL = 5
 
 # Presupuesto del runner (segundos) cuando el servidor no impone limite de tiempo
 DEFAULT_RUNNER_SECONDS = 600
@@ -139,11 +144,6 @@ class GQJob(models.Model):
         readonly=True,
         help="Numero de veces que el runner inicio la ejecucion del job.",
     )
-    channel = fields.Char(
-        string="Channel",
-        default="root",
-        help="Canal logico del job. Actualmente informativo.",
-    )
     identity_key = fields.Char(
         string="Identity Key",
         readonly=True,
@@ -191,7 +191,20 @@ class GQJob(models.Model):
     # ── Resultado ─────────────────────────────────────────────────────────────
 
     result = fields.Text(string="Result", readonly=True)
+    exc_name = fields.Char(string="Exception", readonly=True)
+    exc_message = fields.Char(string="Exception Message", readonly=True)
     exc_info = fields.Text(string="Exception Info", readonly=True)
+    exec_time = fields.Float(
+        string="Execution Time (s)",
+        readonly=True,
+        aggregator="avg",
+        help="Segundos que tomo el ultimo intento del job.",
+    )
+    worker_pid = fields.Integer(
+        string="Worker PID",
+        readonly=True,
+        help="Proceso que ejecuto el ultimo intento del job.",
+    )
 
     # ── Fechas ────────────────────────────────────────────────────────────────
 
@@ -203,6 +216,7 @@ class GQJob(models.Model):
     )
     date_started = fields.Datetime(string="Started At", readonly=True)
     date_done = fields.Datetime(string="Finished At", readonly=True)
+    date_cancelled = fields.Datetime(string="Cancelled At", readonly=True)
 
     def init(self):
         # La cola se consulta por prioridad y antiguedad solo entre pendientes.
@@ -243,25 +257,44 @@ class GQJob(models.Model):
                 "state": GQ_STARTED,
                 "date_started": fields.Datetime.now(),
                 "retry_count": self.retry_count + 1,
+                "worker_pid": os.getpid(),
             }
         )
 
+    def _gq_exec_time(self):
+        """Segundos transcurridos desde que inicio el intento en curso."""
+        if len(self) != 1 or self.state != GQ_STARTED or not self.date_started:
+            return {}
+        elapsed = fields.Datetime.now() - self.date_started
+        return {"exec_time": elapsed.total_seconds()}
+
     def _gq_set_done(self, result=None):
         vals = {"state": GQ_DONE, "date_done": fields.Datetime.now()}
+        vals.update(self._gq_exec_time())
         if result is not None:
             vals["result"] = str(result)
         self.sudo().write(vals)
 
-    def _gq_set_failed(self, exc_info=None):
+    def _gq_set_failed(self, exc_info=None, exc=None):
+        """Marca el job como fallido, detiene su grupo y avisa a ``on_fail``.
+
+        :param exc: excepcion que causo el fallo.
+        """
         vals = {"state": GQ_FAILED, "date_done": fields.Datetime.now()}
+        vals.update(self._gq_exec_time())
         if exc_info:
             vals["exc_info"] = exc_info
+        if exc is not None:
+            vals["exc_name"] = type(exc).__name__
+            vals["exc_message"] = str(exc)
         self.sudo().write(vals)
         self._gq_stop_group()
+        self._gq_call_on_fail()
 
     def _gq_set_cancelled(self):
+        now = fields.Datetime.now()
         self.sudo().write(
-            {"state": GQ_CANCELLED, "date_done": fields.Datetime.now()}
+            {"state": GQ_CANCELLED, "date_done": now, "date_cancelled": now}
         )
 
     def _gq_postpone_pending(self, result=None, seconds=PG_RETRY, reset_retry=False):
@@ -300,9 +333,14 @@ class GQJob(models.Model):
                 "retry_count": 0,
                 "eta": False,
                 "result": False,
+                "exc_name": False,
+                "exc_message": False,
                 "exc_info": False,
+                "exec_time": 0,
+                "worker_pid": 0,
                 "date_started": False,
                 "date_done": False,
+                "date_cancelled": False,
             }
         )
         self._gq_release_waiting()
@@ -381,12 +419,15 @@ class GQJob(models.Model):
             )
 
     @api.model
-    def _gq_release_waiting(self):
+    def _gq_release_waiting(self, from_runner=False):
         """Pasa a 'pending' los jobs en 'waiting' que ya pueden ejecutarse.
 
         Un job puede ejecutarse cuando todas sus dependencias estan en 'done'
         y su grupo no tiene ningun job en 'failed'.
 
+        :param from_runner: el runner procesa los jobs liberados en la misma
+            corrida, asi que no se dispara el cron para ellos (solo se programa
+            para los que tienen una ETA futura).
         :returns: recordset de jobs liberados.
         """
         self.env.flush_all()
@@ -418,7 +459,7 @@ class GQJob(models.Model):
         released = self.browse([row[0] for row in self.env.cr.fetchall()])
         if released:
             self.invalidate_model(["state"])
-            released._gq_ensure_cron_trigger()
+            released._gq_ensure_cron_trigger(immediate=not from_runner)
         return released
 
     # ── Ejecucion ─────────────────────────────────────────────────────────────
@@ -432,23 +473,81 @@ class GQJob(models.Model):
         return self.max_retries == 0 or self.retry_count <= self.max_retries
 
     def _gq_job_env(self):
-        """Entorno con el usuario, modo superusuario y contexto del encolado."""
+        """Entorno con el usuario, modo superusuario y contexto del encolado.
+
+        El contexto incluye ``job_uuid`` para que la funcion sepa en que job corre.
+        """
         self.ensure_one()
-        context = json.loads(self.context or "{}")
+        context = dict(json.loads(self.context or "{}"), job_uuid=self.uuid)
         user = self.user_id.id or self.env.uid
         return self.env(user=user, su=self.run_sudo, context=context)
+
+    def _gq_recordset(self):
+        """Recordset sobre el que se ejecuta la funcion del job."""
+        self.ensure_one()
+        model = self._gq_job_env()[self.model_name]
+        return model.browse(json.loads(self.record_ids or "[]"))
+
+    def _gq_job_config(self):
+        self.ensure_one()
+        return self.env["gq.job.function"].job_config(
+            self.model_name, self.method_name
+        )
 
     def _gq_perform(self):
         """Deserializa y ejecuta el metodo almacenado en el job."""
         self.ensure_one()
-        model = self._gq_job_env()[self.model_name]
-        record_ids = json.loads(self.record_ids or "[]")
-        args = json.loads(self.args or "[]", object_hook=gq_job_decoder)
-        kwargs = json.loads(self.kwargs or "{}", object_hook=gq_job_decoder)
-
-        recordset = model.browse(record_ids) if record_ids else model
+        recordset = self._gq_recordset()
+        decoder = partial(gq_job_decoder, env=recordset.env)
+        args = json.loads(self.args or "[]", object_hook=decoder)
+        kwargs = json.loads(self.kwargs or "{}", object_hook=decoder)
         method = getattr(recordset, self.method_name)
         return method(*args, **kwargs)
+
+    def _gq_retry_seconds(self, err):
+        """Segundos a esperar antes de reintentar tras un error reintentable.
+
+        Por orden: la espera del propio error, la del patron de reintentos de
+        la funcion (la entrada mas alta que no supere el intento actual) y
+        ``RETRY_INTERVAL``.
+        """
+        self.ensure_one()
+        if getattr(err, "seconds", None):
+            return err.seconds
+        pattern = self._gq_job_config()["retry_pattern"]
+        seconds = RETRY_INTERVAL
+        for attempt in sorted(pattern):
+            if attempt > self.retry_count:
+                break
+            seconds = pattern[attempt]
+        if isinstance(seconds, tuple):
+            seconds = random.randint(*seconds)
+        return seconds
+
+    def _gq_call_on_fail(self):
+        """Llama a la funcion ``on_fail`` configurada para los jobs fallidos.
+
+        Un error en esa funcion se registra y no se propaga: el fallo de un job
+        nunca debe interrumpir al runner.
+        """
+        for job in self:
+            function_name = job._gq_job_config()["on_fail_method"]
+            if not function_name:
+                continue
+            try:
+                with self.env.cr.savepoint():
+                    getattr(job._gq_recordset(), function_name)(
+                        exc_name=job.exc_name,
+                        exc_message=job.exc_message,
+                        exc_info=job.exc_info,
+                    )
+            except Exception:
+                _logger.exception(
+                    "GQ Job #%s: error en on_fail %s.%s",
+                    job.id,
+                    job.model_name,
+                    function_name,
+                )
 
     def _gq_process(self, commit=False):
         """Ejecuta el job y gestiona todos los casos de error."""
@@ -484,23 +583,26 @@ class GQJob(models.Model):
             self._gq_set_done(result=msg)
 
         except GQRetryableJobError as err:
-            if self._gq_can_retry():
-                seconds = getattr(err, "seconds", None) or 5
-                self._gq_postpone_pending(result=str(err), seconds=seconds)
+            ignore_retry = getattr(err, "ignore_retry", False)
+            if ignore_retry or self._gq_can_retry():
+                seconds = self._gq_retry_seconds(err)
+                self._gq_postpone_pending(
+                    result=str(err), seconds=seconds, reset_retry=ignore_retry
+                )
                 _logger.debug("GQ Job #%s postponed %ss (retryable)", self.id, seconds)
             else:
                 with StringIO() as buff:
                     traceback.print_exc(file=buff)
                     exc_text = buff.getvalue()
                 _logger.error("GQ Job #%s max retries exceeded:\n%s", self.id, exc_text)
-                self._gq_set_failed(exc_info=exc_text)
+                self._gq_set_failed(exc_info=exc_text, exc=err)
 
-        except (GQFailedJobError, Exception):
+        except (GQFailedJobError, Exception) as err:
             with StringIO() as buff:
                 traceback.print_exc(file=buff)
                 exc_text = buff.getvalue()
             _logger.error("GQ Job #%s failed:\n%s", self.id, exc_text)
-            self._gq_set_failed(exc_info=exc_text)
+            self._gq_set_failed(exc_info=exc_text, exc=err)
 
         if commit:
             self.env.flush_all()
@@ -597,9 +699,16 @@ class GQJob(models.Model):
         if rows:
             ids = [r[0] for r in rows]
             self.invalidate_model(["state", "exc_info", "date_done"])
-            self.browse(
-                [r[0] for r in rows if r[1] == GQ_FAILED]
-            )._gq_stop_group()
+            dead = self.browse([r[0] for r in rows if r[1] == GQ_FAILED])
+            if dead:
+                dead.sudo().write(
+                    {
+                        "exc_name": "GQDeadJobError",
+                        "exc_message": "Worker terminated while running the job",
+                    }
+                )
+                dead._gq_stop_group()
+                dead._gq_call_on_fail()
             _logger.warning(
                 "GQ Queue: %d job(s) huerfano(s) recuperado(s): %s", len(ids), ids
             )
@@ -665,7 +774,7 @@ class GQJob(models.Model):
         deadline = fields.Datetime.now() + timedelta(seconds=max_seconds)
         _logger.debug("GQ Job Runner started (deadline en %ds)", max_seconds)
         self._gq_recover_started_jobs()
-        self._gq_release_waiting()
+        self._gq_release_waiting(from_runner=True)
         job = self._gq_acquire_one_job()
         processed = 0
         while job:
@@ -681,7 +790,7 @@ class GQJob(models.Model):
                 )
                 self._gq_cron_trigger()
                 break
-            self._gq_release_waiting()
+            self._gq_release_waiting(from_runner=True)
             job = self._gq_acquire_one_job()
         _logger.debug("GQ Job Runner finished (%d jobs processed)", processed)
 
@@ -727,16 +836,23 @@ class GQJob(models.Model):
         for cron in crons:
             cron._trigger(at=at)
 
-    def _gq_ensure_cron_trigger(self):
-        """Crea triggers de cron cuando hay jobs pendientes en este recordset."""
+    def _gq_ensure_cron_trigger(self, immediate=True):
+        """Crea triggers de cron cuando hay jobs pendientes en este recordset.
+
+        :param immediate: si es False solo se programan los jobs con ETA futura;
+            lo usa el runner, que ya va a procesar los que estan listos.
+        """
         pending = self.filtered(lambda r: r.state == GQ_PENDING)
         if not pending:
             return
+        now = fields.Datetime.now()
         # Jobs sin ETA: disparar inmediatamente
-        if any(not rec.eta for rec in pending):
+        if immediate and any(not rec.eta for rec in pending):
             self._gq_cron_trigger()
-        # Jobs con ETA futura: programar el cron para esa hora
-        delayed_etas = {rec.eta for rec in pending if rec.eta}
+        # Jobs con ETA: programar el cron para esa hora
+        delayed_etas = {
+            rec.eta for rec in pending if rec.eta and (immediate or rec.eta > now)
+        }
         if delayed_etas:
             self._gq_cron_trigger(at=list(delayed_etas))
 
