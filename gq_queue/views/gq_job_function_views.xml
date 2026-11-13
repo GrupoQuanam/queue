@@ -28,6 +28,9 @@
                         <group string="Jobs">
                             <field name="retry_pattern" placeholder="{1: 10, 5: 60, 10: 300}"/>
                             <field name="on_fail_method"/>
+                            <field name="related_action_enable"/>
+                            <field name="related_action_method"
+                                   invisible="not related_action_enable"/>
                         </group>
                     </group>
                 </sheet>

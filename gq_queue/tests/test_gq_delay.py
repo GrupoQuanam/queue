@@ -60,7 +60,9 @@ class TestGQDelay(GQCommon):
         self.assertEqual(self._labels(), ["a"])
 
     def test_deferred_set_options(self):
-        deferred = self._deferred("a", priority=50).set(priority=3, description="Paso A")
+        deferred = self._deferred("a", priority=50).set(
+            priority=3, description="Paso A"
+        )
         job = deferred.delay()
         self.assertEqual(job.priority, 3)
         self.assertEqual(job.name, "Paso A")
@@ -138,7 +140,9 @@ class TestGQDelay(GQCommon):
         b = self._deferred("b")
         end = self._deferred("end", priority=1)
         jobs = gq_chain(a, b).on_done(end).delay()
-        self.assertEqual(jobs[2].depends_on_ids, jobs[1], "Espera al final de la cadena")
+        self.assertEqual(
+            jobs[2].depends_on_ids, jobs[1], "Espera al final de la cadena"
+        )
         self._run()
         self.assertEqual(self._labels(), ["a", "b", "end"])
 

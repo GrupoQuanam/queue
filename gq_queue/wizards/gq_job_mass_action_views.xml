@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <record id="gq_job_mass_action_view_form" model="ir.ui.view">
+        <field name="name">gq.job.mass.action.form</field>
+        <field name="model">gq.job.mass.action</field>
+        <field name="arch" type="xml">
+            <form>
+                <field name="operation" invisible="1"/>
+                <p invisible="operation != 'requeue'">
+                    Requeue <field name="job_count" class="oe_inline"/> job(s)?
+                    Failed, cancelled and done jobs go back to the queue with
+                    their attempts reset.
+                </p>
+                <p invisible="operation != 'cancel'">
+                    Cancel <field name="job_count" class="oe_inline"/> job(s)?
+                    Waiting, pending and failed jobs will not run.
+                </p>
+                <p invisible="operation != 'set_done'">
+                    Set <field name="job_count" class="oe_inline"/> job(s) to done
+                    without running them? Jobs depending on them will be released.
+                </p>
+                <field name="job_ids" invisible="1"/>
+                <footer>
+                    <button name="action_apply" type="object" string="Confirm"
+                            class="btn-primary" data-hotkey="q"/>
+                    <button string="Discard" special="cancel" data-hotkey="x"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+
+    <record id="gq_job_mass_action_requeue" model="ir.actions.act_window">
+        <field name="name">Requeue</field>
+        <field name="res_model">gq.job.mass.action</field>
+        <field name="view_mode">form</field>
+        <field name="target">new</field>
+        <field name="context">{'default_operation': 'requeue'}</field>
+        <field name="binding_model_id" ref="model_gq_job"/>
+        <field name="binding_view_types">list,form</field>
+    </record>
+
+    <record id="gq_job_mass_action_cancel" model="ir.actions.act_window">
+        <field name="name">Cancel</field>
+        <field name="res_model">gq.job.mass.action</field>
+        <field name="view_mode">form</field>
+        <field name="target">new</field>
+        <field name="context">{'default_operation': 'cancel'}</field>
+        <field name="binding_model_id" ref="model_gq_job"/>
+        <field name="binding_view_types">list,form</field>
+    </record>
+
+    <record id="gq_job_mass_action_set_done" model="ir.actions.act_window">
+        <field name="name">Set to Done</field>
+        <field name="res_model">gq.job.mass.action</field>
+        <field name="view_mode">form</field>
+        <field name="target">new</field>
+        <field name="context">{'default_operation': 'set_done'}</field>
+        <field name="binding_model_id" ref="model_gq_job"/>
+        <field name="binding_view_types">list,form</field>
+    </record>
+
+</odoo>

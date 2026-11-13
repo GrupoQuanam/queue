@@ -12,10 +12,6 @@
                   decoration-success="state == 'done'"
                   decoration-warning="state == 'started'"
                   decoration-info="state == 'waiting'">
-                <header>
-                    <button name="action_requeue" type="object" string="Requeue"/>
-                    <button name="action_cancel" type="object" string="Cancel"/>
-                </header>
                 <field name="name"/>
                 <field name="model_name"/>
                 <field name="method_name"/>
@@ -47,6 +43,9 @@
                             invisible="state not in ('failed', 'cancelled', 'done')"/>
                     <button name="action_cancel" type="object" string="Cancel"
                             invisible="state not in ('waiting', 'pending', 'failed')"/>
+                    <button name="action_set_done" type="object" string="Set to Done"
+                            invisible="state not in ('waiting', 'pending', 'failed', 'cancelled')"
+                            confirm="Set this job to done without running it?"/>
                     <button name="action_cancel_group" type="object" string="Cancel Group"
                             invisible="not group_uuid"
                             confirm="Cancel every job of this group that has not run yet?"/>
@@ -54,9 +53,13 @@
                            statusbar_visible="waiting,pending,started,done,failed"/>
                 </header>
                 <sheet>
-                    <div class="oe_button_box" name="button_box" invisible="not group_uuid">
+                    <div class="oe_button_box" name="button_box">
+                        <button name="action_open_related" type="object"
+                                class="oe_stat_button" icon="fa-external-link"
+                                string="Related"/>
                         <button name="action_view_group" type="object"
-                                class="oe_stat_button" icon="fa-tasks">
+                                class="oe_stat_button" icon="fa-tasks"
+                                invisible="not group_uuid">
                             <div class="o_field_widget o_stat_info">
                                 <span class="o_stat_value">
                                     <field name="group_done_count"/> /
@@ -114,6 +117,10 @@
                                 </field>
                             </group>
                         </page>
+                        <page string="Graph" name="graph" invisible="not has_graph">
+                            <field name="has_graph" invisible="1"/>
+                            <field name="dependency_graph" widget="gq_job_graph" nolabel="1"/>
+                        </page>
                         <page string="Result">
                             <group>
                                 <field name="result"/>
@@ -137,6 +144,7 @@
                         </page>
                     </notebook>
                 </sheet>
+                <chatter/>
             </form>
         </field>
     </record>
@@ -167,6 +175,9 @@
                 <filter name="cancelled" string="Cancelled"
                         domain="[('state','=','cancelled')]"/>
                 <separator/>
+                <filter name="my_followed" string="Followed by Me"
+                        domain="[('message_is_follower', '=', True)]"/>
+                <separator/>
                 <group expand="0" string="Group By">
                     <filter name="group_state" string="State"
                             context="{'group_by': 'state'}"/>
@@ -196,7 +207,7 @@
     <menuitem
         id="gq_queue_menu_root"
         name="GQ Queue"
-        groups="base.group_system"
+        groups="group_gq_queue_manager"
         sequence="100"/>
 
     <menuitem

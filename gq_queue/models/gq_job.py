@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from datetime import timedelta
 from functools import partial
 
+from markupsafe import Markup
 from psycopg2 import OperationalError
 from psycopg2.extensions import TransactionRollbackError
 
@@ -37,6 +38,8 @@ ORPHAN_RETRY_SECONDS = 60
 GQ_LOCK_NAMESPACE = zlib.crc32(b"gq.job") & 0x7FFFFFFF
 # Reintentos de una operacion de la cola ante un conflicto con otro runner
 CONFLICT_RETRIES = 10
+# Jobs como maximo en el grafo de dependencias de la vista
+MAX_GRAPH_NODES = 300
 # Dias que se conservan los jobs terminados (parametro gq_queue.keep_done_days)
 DEFAULT_KEEP_DONE_DAYS = 30
 
@@ -51,6 +54,7 @@ GQ_CANCELLED = "cancelled"
 class GQJob(models.Model):
     _name = "gq.job"
     _description = "GQ Queue Job"
+    _inherit = ["mail.thread"]
     _order = "priority asc, date_created asc, id asc"
 
     # ── Identificacion ────────────────────────────────────────────────────────
@@ -196,6 +200,12 @@ class GQJob(models.Model):
     group_done_count = fields.Integer(
         string="Done in Group", compute="_compute_group_progress"
     )
+    has_graph = fields.Boolean(compute="_compute_has_graph")
+    dependency_graph = fields.Json(
+        string="Dependency Graph",
+        compute="_compute_dependency_graph",
+        help="Jobs conectados con este por dependencias o por su grupo.",
+    )
 
     # ── Resultado ─────────────────────────────────────────────────────────────
 
@@ -264,6 +274,58 @@ class GQJob(models.Model):
                 job.group_uuid, (0, 0)
             )
 
+    @api.depends("group_uuid", "depends_on_ids", "dependent_ids")
+    def _compute_has_graph(self):
+        for job in self:
+            job.has_graph = bool(
+                job.group_uuid or job.depends_on_ids or job.dependent_ids
+            )
+
+    @api.depends("group_uuid", "depends_on_ids", "dependent_ids", "state")
+    def _compute_dependency_graph(self):
+        """Grafo de los jobs conectados: nodos y aristas para el widget.
+
+        Recorre dependencias en ambos sentidos y los jobs del mismo grupo,
+        hasta ``MAX_GRAPH_NODES`` jobs.
+        """
+        for job in self:
+            if not job.id or not job.has_graph:
+                job.dependency_graph = False
+                continue
+            jobs = job._gq_connected_jobs()
+            job.dependency_graph = {
+                "current": job.id,
+                "truncated": len(jobs) >= MAX_GRAPH_NODES,
+                "nodes": [
+                    {"id": node.id, "name": node.name or "", "state": node.state}
+                    for node in jobs
+                ],
+                # Aristas (dependencia, dependiente): la primera va antes
+                "edges": [
+                    [dependency.id, node.id]
+                    for node in jobs
+                    for dependency in node.depends_on_ids
+                    if dependency in jobs
+                ],
+            }
+
+    def _gq_connected_jobs(self):
+        """Jobs alcanzables desde este por dependencias o grupo."""
+        self.ensure_one()
+        Job = self.sudo()
+        seen = self
+        frontier = self
+        while frontier and len(seen) < MAX_GRAPH_NODES:
+            groups = [uuid for uuid in set(frontier.mapped("group_uuid")) if uuid]
+            found = frontier.depends_on_ids | frontier.dependent_ids
+            if groups:
+                found |= Job.search(
+                    [("group_uuid", "in", groups)], limit=MAX_GRAPH_NODES
+                )
+            frontier = (found - seen)[: MAX_GRAPH_NODES - len(seen)]
+            seen |= frontier
+        return seen
+
     # ── Maquina de estados ────────────────────────────────────────────────────
 
     def _gq_set_started(self):
@@ -304,8 +366,63 @@ class GQJob(models.Model):
             vals["exc_name"] = type(exc).__name__
             vals["exc_message"] = str(exc)
         self.sudo().write(vals)
+        self._gq_after_failure()
+
+    def _gq_after_failure(self):
+        """Reacciona a jobs que fallaron definitivamente.
+
+        Detiene sus grupos, llama a ``on_fail`` y avisa del fallo en el chatter.
+        """
         self._gq_stop_group()
         self._gq_call_on_fail()
+        self._gq_message_post_on_failure()
+
+    def _gq_message_post_on_failure(self):
+        """Suscribe a quienes deben enterarse y publica el fallo en el job.
+
+        Un error al avisar se registra y no se propaga: nunca debe interrumpir
+        al runner.
+        """
+        for job in self:
+            try:
+                with self.env.cr.savepoint():
+                    users = job._gq_failure_followers()
+                    job.message_subscribe(partner_ids=users.partner_id.ids)
+                    body = job._gq_message_failed_job()
+                    if body:
+                        job.message_post(
+                            body=body, subtype_xmlid="gq_queue.mt_job_failed"
+                        )
+            except Exception:
+                _logger.exception("GQ Job #%s: error al avisar del fallo", job.id)
+
+    def _gq_failure_followers(self):
+        """Usuarios a avisar del fallo del job.
+
+        Los gestores de la cola con acceso a la compania del job, y quien lo
+        encolo si es usuario interno.
+        """
+        self.ensure_one()
+        group = self.env.ref("gq_queue.group_gq_queue_manager")
+        domain = [("groups_id", "in", group.ids), ("share", "=", False)]
+        if self.company_id:
+            domain.append(("company_ids", "in", self.company_id.ids))
+        users = self.env["res.users"].sudo().search(domain)
+        if self.user_id and not self.user_id.share and self.user_id.active:
+            users |= self.user_id
+        return users
+
+    def _gq_message_failed_job(self):
+        """Mensaje publicado en el job al fallar. Vacio: no se publica."""
+        self.ensure_one()
+        return Markup("<p>%s</p><p><strong>%s</strong>: %s</p>") % (
+            _(
+                "The job failed and will not be retried. More details in the "
+                "Result tab."
+            ),
+            self.exc_name or _("Error"),
+            self.exc_message or "",
+        )
 
     def _gq_set_cancelled(self):
         now = fields.Datetime.now()
@@ -337,12 +454,8 @@ class GQJob(models.Model):
         hechas y su grupo no tiene otro job fallido.
         """
         self.check_access("write")
-        if self.filtered(
-            lambda job: job.state in (GQ_WAITING, GQ_PENDING, GQ_STARTED)
-        ):
-            raise UserError(
-                _("Only failed, cancelled or done jobs can be requeued.")
-            )
+        if self.filtered(lambda job: job.state in (GQ_WAITING, GQ_PENDING, GQ_STARTED)):
+            raise UserError(_("Only failed, cancelled or done jobs can be requeued."))
         self.sudo().write(
             {
                 "state": GQ_WAITING,
@@ -388,6 +501,70 @@ class GQJob(models.Model):
             lambda job: job.state in (GQ_WAITING, GQ_PENDING, GQ_FAILED)
         )._gq_set_cancelled()
         return True
+
+    def action_set_done(self):
+        """Marca como hechos jobs que no se ejecutaran (sin ejecutarlos).
+
+        Libera a los jobs que dependian de ellos y, si eran el fallo de un
+        grupo, reanuda el grupo.
+        """
+        self.check_access("write")
+        if self.filtered(lambda job: job.state == GQ_STARTED):
+            raise UserError(_("A running job cannot be set to done."))
+        self.filtered(lambda job: job.state != GQ_DONE)._gq_set_done(
+            result=_("Manually set to done by %s", self.env.user.name)
+        )
+        self._gq_release_waiting()
+        return True
+
+    def action_open_related(self):
+        """Abre la accion relacionada del job (por defecto, sus registros).
+
+        La funcion del job puede configurar otra accion o desactivarla en
+        ``gq.job.function``.
+        """
+        self.ensure_one()
+        config = self._gq_job_config()
+        if not config["related_action_enable"]:
+            raise UserError(_("No action available for this job."))
+        function_name = config["related_action_method"] or "_gq_related_records_action"
+        action = getattr(self, function_name)()
+        if not action:
+            raise UserError(_("No action available for this job."))
+        return action
+
+    def _gq_related_records_action(self):
+        """Accion relacionada por defecto: los registros sobre los que corre.
+
+        :returns: accion de ventana, o None si los registros ya no existen.
+        """
+        self.ensure_one()
+        if self.model_name not in self.env:
+            return None
+        records = (
+            self.env[self.model_name]
+            .browse(json.loads(self.record_ids or "[]"))
+            .exists()
+        )
+        if not records:
+            return None
+        if len(records) == 1:
+            return {
+                "type": "ir.actions.act_window",
+                "name": _("Related Record"),
+                "res_model": records._name,
+                "view_mode": "form",
+                "views": [(False, "form")],
+                "res_id": records.id,
+            }
+        return {
+            "type": "ir.actions.act_window",
+            "name": _("Related Records"),
+            "res_model": records._name,
+            "view_mode": "list,form",
+            "views": [(False, "list"), (False, "form")],
+            "domain": [("id", "in", records.ids)],
+        }
 
     def action_view_group(self):
         self.ensure_one()
@@ -509,9 +686,7 @@ class GQJob(models.Model):
 
     def _gq_job_config(self):
         self.ensure_one()
-        return self.env["gq.job.function"].job_config(
-            self.model_name, self.method_name
-        )
+        return self.env["gq.job.function"].job_config(self.model_name, self.method_name)
 
     def _gq_perform(self):
         """Deserializa y ejecuta el metodo almacenado en el job."""
@@ -623,7 +798,9 @@ class GQJob(models.Model):
             else:
                 # No deberia ocurrir: el job esta pendiente pero otra sesion
                 # viva lo tiene. Se deja para mas tarde sin contar el intento.
-                _logger.warning("GQ Job #%s en uso por otra sesion, se pospone", self.id)
+                _logger.warning(
+                    "GQ Job #%s en uso por otra sesion, se pospone", self.id
+                )
                 self._gq_postpone_pending(seconds=PG_RETRY)
             if commit:
                 self.env.flush_all()
@@ -825,8 +1002,7 @@ class GQJob(models.Model):
                     "exc_message": "Worker terminated while running the job",
                 }
             )
-            dead._gq_stop_group()
-            dead._gq_call_on_fail()
+            dead._gq_after_failure()
         retry_at = {r[2] for r in rows if r[1] == GQ_PENDING}
         if retry_at:
             self._gq_cron_trigger(at=list(retry_at))
@@ -881,7 +1057,8 @@ class GQJob(models.Model):
             processed += 1
             if fields.Datetime.now() >= deadline:
                 _logger.info(
-                    "GQ Runner: deadline alcanzado (%ds), re-disparando cron", max_seconds
+                    "GQ Runner: deadline alcanzado (%ds), re-disparando cron",
+                    max_seconds,
                 )
                 self._gq_cron_trigger()
                 break
@@ -940,7 +1117,9 @@ class GQJob(models.Model):
         )
         if self.env.cr.rowcount:
             self.invalidate_model()
-            _logger.info("GQ Queue: %d job(s) terminados borrados", self.env.cr.rowcount)
+            _logger.info(
+                "GQ Queue: %d job(s) terminados borrados", self.env.cr.rowcount
+            )
 
     # ── Triggers de cron ──────────────────────────────────────────────────────
 
@@ -999,7 +1178,12 @@ class GQJob(models.Model):
         for vals in vals_list:
             if vals.get("state", GQ_PENDING) == GQ_PENDING:
                 vals.setdefault("date_enqueued", now)
-        records = super().create(vals_list)
+        # Encolar no deja mensajes ni seguidores: se suscribe a quien avisar
+        # solo cuando el job falla.
+        quiet = self.with_context(
+            mail_create_nolog=True, mail_create_nosubscribe=True, tracking_disable=True
+        )
+        records = super(GQJob, quiet).create(vals_list).with_env(self.env)
         records._gq_ensure_cron_trigger()
         return records
 

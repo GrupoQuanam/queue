@@ -64,7 +64,8 @@ Módulo Odoo 18 para ejecución asíncrona de tareas en segundo plano mediante C
 
 ## 2. Instalación y dependencias
 
-**Dependencias Odoo:** solo `base`.
+**Dependencias Odoo:** `base`, `web` y `mail` (chatter y avisos por fallo, ver
+[Avisos por fallo](#avisos-por-fallo)).
 
 **Dependencias Python:** `psycopg2` (incluida en cualquier instalación estándar de Odoo).
 
@@ -94,9 +95,14 @@ gq_queue/
 │   ├── gq_job_function.py     # Configuración por función (reintentos, on_fail)
 │   └── ir_cron.py             # Agrega campo gq_job_runner a ir.cron
 ├── security/
+│   ├── gq_queue_security.xml  # Grupo GQ Queue Manager y regla multicompañía
 │   └── ir.model.access.csv
+├── wizards/
+│   └── gq_job_mass_action.py  # Requeue / Cancel / Set to Done masivos
+├── static/
+│   ├── src/gq_job_graph/      # Widget del grafo de dependencias
+│   └── tests/tours/           # Tour del widget
 ├── tests/
-│   └── test_gq_job.py
 ├── data/
 │   └── ir_cron.xml            # Cron "GQ Queue Job Runner"
 └── views/
@@ -517,6 +523,8 @@ En **GQ Queue → Job Functions** se configura, por modelo y función:
 |---|---|
 | `retry_pattern` | Espera según el número de intento, ante errores reintentables sin `seconds`. |
 | `on_fail_method` | Función del modelo que se llama cuando el job falla definitivamente. |
+| `related_action_enable` | Muestra el botón **Related** del job (por defecto, sí). |
+| `related_action_method` | Función de `gq.job` que devuelve la acción del botón **Related**. Vacío: abre los registros del job. |
 
 Sin registro para una función, sus jobs usan los valores por defecto.
 
@@ -549,6 +557,19 @@ También por datos XML, desde el módulo que define la función:
     <field name="retry_pattern">{1: 10, 5: 60, 10: 300}</field>
     <field name="on_fail_method">_al_fallar_sync</field>
 </record>
+```
+
+**Acción relacionada.** El botón **Related** del job abre, por defecto, el registro sobre el
+que corre (o la lista, si son varios). Para abrir otra cosa, se define una función en
+`gq.job` y se la indica en `related_action_method`:
+
+```python
+class GQJob(models.Model):
+    _inherit = "gq.job"
+
+    def _abrir_factura_sync(self):
+        factura = self._gq_recordset()
+        return factura.action_view_sync_log()
 ```
 
 ### 9.2 Saber en qué job corre la función
@@ -742,12 +763,31 @@ sistema `gq_queue.keep_done_days` (`0` = no borrar).
 
 ### Gestión desde la interfaz
 
-En **GQ Queue → Jobs** (solo `base.group_system`), desde el formulario o seleccionando
-varios en la lista:
+En **GQ Queue → Jobs** (grupo **GQ Queue Manager**), desde el formulario o, para varios
+jobs, desde el menú **Acción** de la lista (cada acción pide confirmación):
 
 - **Requeue**: vuelve a encolar un job `failed`, `cancelled` o `done` y reinicia sus intentos. Pasa a `pending`, o queda en `waiting` si tiene dependencias sin terminar o su grupo sigue detenido.
 - **Cancel**: cancela un job `waiting`, `pending` o `failed`. Un job `started` no se puede cancelar.
-- **Cancel Group**: cancela todos los jobs no ejecutados del grupo.
+- **Set to Done**: marca como hecho, sin ejecutarlo, un job que no está en ejecución. Libera a los jobs que dependían de él; si era el fallo de un grupo, el grupo sigue.
+- **Cancel Group** (formulario): cancela todos los jobs no ejecutados del grupo.
+- **Related** (formulario): abre la acción relacionada del job (ver 9.1).
+
+La pestaña **Graph** dibuja los jobs conectados con el actual, por dependencias o por grupo:
+columnas de izquierda a derecha (una dependencia queda siempre antes que sus dependientes),
+color según el estado y clic para abrir un job. Muestra hasta 300 jobs.
+
+### Avisos por fallo
+
+Los jobs tienen chatter y filtro **Followed by Me**. Cuando un job falla definitivamente
+(error no reintentable, reintentos agotados o worker muerto):
+
+1. Se suscriben al job los usuarios de **GQ Queue Manager** con acceso a su compañía y quien
+   lo encoló (si es usuario interno).
+2. Se publica un mensaje con subtipo **Job failed**, con la excepción y su mensaje.
+
+Encolar no crea mensajes ni seguidores. Funciones extensibles: `_gq_failure_followers()`
+(a quién avisar) y `_gq_message_failed_job()` (texto; vacío = no publicar). Un error al
+avisar se registra y no interrumpe al runner.
 
 ### Requisitos del servidor
 
@@ -790,7 +830,10 @@ abre una conexión para avisar a los workers de cron al confirmar.
 ### Permisos
 
 - Encolar con `with_gq_delay()` no requiere permisos sobre `gq.job` (se crea con `sudo()`).
-- Solo `base.group_system` puede leer y gestionar los jobs y ver el menú **GQ Queue**.
+- Solo el grupo **GQ Queue Manager** puede leer y gestionar los jobs y ver el menú
+  **GQ Queue**. Los administradores (`base.group_system`) lo tienen siempre; se puede dar a
+  otros usuarios sin hacerlos administradores.
+- Regla multicompañía: cada usuario ve los jobs de sus compañías y los que no tienen compañía.
 - El job se ejecuta con el usuario, el modo `sudo()` y el contexto de quien lo encoló.
 
 ### Variables de entorno
@@ -808,6 +851,8 @@ No se requieren variables de entorno adicionales.
 | `action_requeue()` | Vuelve a encolar jobs terminados y reinicia sus intentos |
 | `action_cancel()` | Cancela jobs en espera, pendientes o fallidos |
 | `action_cancel_group()` | Cancela todos los jobs no ejecutados del grupo |
+| `action_set_done()` | Marca jobs como hechos sin ejecutarlos y libera a sus dependientes |
+| `action_open_related()` | Abre la acción relacionada del job |
 | `_gq_release_waiting()` | Pasa a `pending` los jobs en `waiting` que ya pueden ejecutarse |
 | `_gq_job_runner(commit=True, max_seconds=None)` | Entry point del cron. Procesa la cola dentro del presupuesto de tiempo. |
 | `_gq_cron_trigger(at=None)` | Dispara todos los crons `gq_job_runner`. |

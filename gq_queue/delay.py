@@ -195,9 +195,7 @@ class GQCall:
             self.name,
             ", ".join(repr(a) for a in self.args[:2]),
         )
-        context = {
-            key: env.context[key] for key in CONTEXT_KEYS if key in env.context
-        }
+        context = {key: env.context[key] for key in CONTEXT_KEYS if key in env.context}
         common = {
             "user_id": env.uid,
             "company_id": env.company.id,

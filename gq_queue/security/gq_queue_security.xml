@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <record id="module_category_gq_queue" model="ir.module.category">
+        <field name="name">GQ Queue</field>
+        <field name="sequence">20</field>
+    </record>
+
+    <!-- Gestiona la cola sin ser administrador. Los administradores lo tienen
+         siempre: base.group_system lo implica. -->
+    <record id="group_gq_queue_manager" model="res.groups">
+        <field name="name">GQ Queue Manager</field>
+        <field name="category_id" ref="module_category_gq_queue"/>
+    </record>
+
+    <record id="base.group_system" model="res.groups">
+        <field name="implied_ids" eval="[(4, ref('group_gq_queue_manager'))]"/>
+    </record>
+
+    <data noupdate="1">
+        <record id="gq_job_comp_rule" model="ir.rule">
+            <field name="name">GQ Queue Job: multi-company</field>
+            <field name="model_id" ref="model_gq_job"/>
+            <field name="global" eval="True"/>
+            <field name="domain_force">['|', ('company_id', '=', False), ('company_id', 'in', company_ids)]</field>
+        </record>
+    </data>
+
+</odoo>

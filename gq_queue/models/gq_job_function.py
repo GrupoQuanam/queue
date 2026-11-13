@@ -32,6 +32,16 @@ class GQJobFunction(models.Model):
         "reintentara. Recibe exc_name, exc_message y exc_info. No debe hacer "
         "commit.",
     )
+    related_action_enable = fields.Boolean(
+        string="Related Action",
+        default=True,
+        help="Muestra en el job el boton que abre su accion relacionada.",
+    )
+    related_action_method = fields.Char(
+        string="Related Action Function",
+        help="Funcion de gq.job que devuelve la accion relacionada del job. "
+        "Vacio: abre los registros sobre los que corre el job.",
+    )
 
     _sql_constraints = [
         (
@@ -114,6 +124,19 @@ class GQJobFunction(models.Model):
                         )
                     )
 
+    @api.constrains("related_action_method")
+    def _check_related_action_method(self):
+        job_cls = type(self.env["gq.job"])
+        for record in self:
+            function_name = record.related_action_method
+            if function_name and not callable(getattr(job_cls, function_name, None)):
+                raise ValidationError(
+                    _(
+                        "Model gq.job has no function %(function)s.",
+                        function=function_name,
+                    )
+                )
+
     # ── Lectura de la configuracion ───────────────────────────────────────────
 
     @api.model
@@ -121,8 +144,10 @@ class GQJobFunction(models.Model):
     def job_config(self, model_name, method_name):
         """Configuracion efectiva de los jobs de una funcion.
 
-        :returns: dict con ``retry_pattern`` (ya convertido) y
-            ``on_fail_method``. No modificar: el valor se comparte por cache.
+        :returns: dict con ``retry_pattern`` (ya convertido),
+            ``on_fail_method``, ``related_action_enable`` y
+            ``related_action_method``. No modificar: el valor se comparte por
+            cache.
         """
         record = self.sudo().search(
             [("model_id.model", "=", model_name), ("method", "=", method_name)],
@@ -131,6 +156,8 @@ class GQJobFunction(models.Model):
         return {
             "retry_pattern": self._parse_retry_pattern(record.retry_pattern),
             "on_fail_method": record.on_fail_method or False,
+            "related_action_enable": record.related_action_enable if record else True,
+            "related_action_method": record.related_action_method or False,
         }
 
     @api.model_create_multi

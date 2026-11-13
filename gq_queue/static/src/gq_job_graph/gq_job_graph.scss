@@ -1,0 +1,71 @@
+.o_gq_job_graph {
+    overflow: auto;
+    max-height: 600px;
+
+    svg {
+        display: block;
+    }
+
+    .o_gq_edge {
+        fill: none;
+        stroke: var(--bs-secondary-color);
+        stroke-width: 1.5;
+    }
+
+    .o_gq_arrow {
+        fill: var(--bs-secondary-color);
+    }
+
+    .o_gq_node {
+        cursor: pointer;
+
+        rect {
+            fill: var(--bs-secondary-bg);
+            stroke: var(--bs-border-color);
+            stroke-width: 1;
+        }
+
+        text {
+            fill: var(--bs-body-color);
+            font-size: 12px;
+        }
+    }
+
+    .o_gq_node_waiting rect {
+        fill: var(--bs-info-bg-subtle);
+        stroke: var(--bs-info-border-subtle);
+    }
+
+    .o_gq_node_started rect {
+        fill: var(--bs-warning-bg-subtle);
+        stroke: var(--bs-warning-border-subtle);
+    }
+
+    .o_gq_node_done rect {
+        fill: var(--bs-success-bg-subtle);
+        stroke: var(--bs-success-border-subtle);
+    }
+
+    .o_gq_node_failed rect {
+        fill: var(--bs-danger-bg-subtle);
+        stroke: var(--bs-danger-border-subtle);
+    }
+
+    .o_gq_node_cancelled text {
+        fill: var(--bs-secondary-color);
+        text-decoration: line-through;
+    }
+
+    .o_gq_node_current {
+        cursor: default;
+
+        rect {
+            stroke: var(--bs-primary);
+            stroke-width: 2.5;
+        }
+
+        text {
+            font-weight: bold;
+        }
+    }
+}
