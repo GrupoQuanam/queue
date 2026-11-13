@@ -29,7 +29,8 @@ class GQJobFunction(models.Model):
     on_fail_method = fields.Char(
         string="On Fail Function",
         help="Funcion del modelo que se llama cuando el job falla y no se "
-        "reintentara. Recibe exc_name, exc_message y exc_info.",
+        "reintentara. Recibe exc_name, exc_message y exc_info. No debe hacer "
+        "commit.",
     )
 
     _sql_constraints = [

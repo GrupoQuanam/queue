@@ -142,6 +142,7 @@ Tabla PostgreSQL: `gq_job`
 | `exec_time` | Float | Segundos que tomó el último intento |
 | `worker_pid` | Integer | Proceso que ejecutó el último intento |
 | `date_created` | Datetime | Fecha de creación del job |
+| `date_enqueued` | Datetime | Última vez que pasó a `pending` (al crearse, al liberarse de `waiting` o al volver a la cola para un reintento) |
 | `date_started` | Datetime | Fecha en que el runner comenzó a ejecutarlo |
 | `date_done` | Datetime | Fecha de finalización (done, failed o cancelled) |
 | `date_cancelled` | Datetime | Fecha de cancelación |
@@ -292,6 +293,90 @@ grupo. **Cancel Group** cancela todos los jobs del grupo que no se han ejecutado
 
 Cancelar solo el job fallido reanuda el resto del grupo, salvo los jobs que dependen del
 cancelado: esos quedan en `waiting`, porque una dependencia cancelada nunca llega a `done`.
+
+### Grafos declarativos: `gq_delayable`, `gq_chain`, `gq_group`
+
+`gq_delayable()` prepara una llamada **sin encolarla**; acepta las mismas opciones que
+`with_gq_delay()`. Las llamadas se combinan y todo el grafo se encola con `delay()`:
+
+```python
+from odoo.addons.gq_queue.delay import gq_chain, gq_group
+
+# Secuencia: cada paso espera al anterior
+gq_chain(
+    self.gq_delayable()._exportar(),
+    self.gq_delayable()._enviar(),
+    self.gq_delayable()._archivar(),
+).delay()
+
+# Paralelo y, al terminar todos, un paso final
+gq_group(
+    lote1.gq_delayable()._procesar(),
+    lote2.gq_delayable()._procesar(),
+).on_done(self.gq_delayable()._notificar_fin()).delay()
+
+# Combinado: inicio -> (b y c en paralelo) -> fin
+gq_chain(
+    self.gq_delayable()._inicio(),
+    gq_group(a.gq_delayable()._paso(), b.gq_delayable()._paso()),
+    self.gq_delayable(priority=1)._fin(),
+).delay()
+```
+
+| Elemento | Efecto |
+|---|---|
+| `gq_chain(a, b, c)` | Ejecuta en orden: cada nodo depende del anterior. |
+| `gq_group(a, b, c)` | Sin orden entre sí: pueden correr en paralelo. |
+| `nodo.on_done(x, y)` | `x` e `y` corren cuando `nodo` terminó bien. Retorna `nodo`. |
+| `llamada.set(priority=1)` | Cambia opciones de una llamada ya preparada. |
+| `nodo.delay()` | Encola **todo** el grafo conectado y retorna sus `gq.job`. |
+
+Los jobs de un grafo comparten grupo: si uno falla, el resto no se ejecuta hasta
+reencolarlo. Una dependencia circular lanza `ValueError` en `delay()`. Por debajo es el
+mismo mecanismo de `depends_on` y `group`.
+
+### Ejecutar en línea, sin encolar
+
+Con `gq_queue__no_delay` en el contexto, o la variable de entorno `GQ_QUEUE__NO_DELAY=1`,
+las funciones se ejecutan de inmediato en lugar de encolarse. Pensado para tests y
+depuración de módulos que encolan.
+
+```python
+# En un test: el efecto es inmediato, sin correr el runner
+record.with_context(gq_queue__no_delay=True).accion_que_encola()
+```
+
+En este modo `with_gq_delay().funcion()` retorna el resultado de la función (lista de
+resultados con `chunk_size`) en lugar del `gq.job`, y `delay()` de un grafo ejecuta las
+funciones en orden y retorna `None`.
+
+### Encolar automáticamente una función existente
+
+`_patch_gq_job_auto_delay` vuelve asíncrona una función sin modificar a quien la llama.
+Útil cuando la llamada está en código de otro módulo.
+
+```python
+def _generar_pdf(self, plantilla):
+    ...
+
+# Opcional: opciones del job, con los mismos argumentos de la función
+def _generar_pdf_gq_job_options(self, plantilla):
+    return {"priority": 20, "description": f"PDF {plantilla}"}
+
+def _register_hook(self):
+    self._gq_patch_method(
+        "_generar_pdf",
+        self._patch_gq_job_auto_delay("_generar_pdf", context_key="gq_auto_delay_pdf"),
+    )
+    return super()._register_hook()
+
+# Solo se encola cuando quien llama lo pide por contexto:
+self.with_context(gq_auto_delay_pdf=True).accion_que_genera_pdf()
+```
+
+Usar siempre `context_key`: sin él la función se encola en **todas** las llamadas, y eso
+rompe a quien espera su resultado o su efecto inmediato. Dentro de un job y en modo sin
+encolado la función se ejecuta directamente.
 
 ### Evitar duplicados: clave de identidad
 
@@ -538,28 +623,40 @@ El presupuesto se revisa **entre jobs**: un job individual debe durar menos que 
 
 ### Jobs huérfanos
 
-El runner confirma en BD el estado `started` y el intento **antes** de ejecutar, y mantiene
-bloqueada la fila del job hasta terminar. Si el worker muere (timeout, memoria, reinicio),
-el job queda en `started` sin bloqueo. El siguiente runner lo detecta cuando además inició
-hace más tiempo que el límite del servidor, y:
+Mientras un job corre, el runner mantiene un **bloqueo consultivo de PostgreSQL**
+(`pg_try_advisory_xact_lock`) en una conexión aparte, y confirma en BD el estado `started`
+y el intento **antes** de ejecutar. Si el worker muere (timeout, memoria, reinicio),
+PostgreSQL suelta el bloqueo al cerrarse la conexión y el job queda en `started` sin él: es
+un huérfano. El siguiente runner lo detecta de inmediato, sin plazos, y:
 
-- lo devuelve a `pending` si le quedan intentos;
+- lo devuelve a `pending` con 60 segundos de espera, si le quedan intentos;
 - lo pasa a `failed` si `retry_count > max_retries` (con `max_retries = 0`, tras 5 intentos).
 
-Así un job que mata al worker no se reintenta sin fin. El runner se programa solo para
-revisar el job cuando se cumple el plazo.
+Así un job que mata al worker no se reintenta sin fin, ni varias veces seguidas.
 
-**Las funciones encoladas no deben hacer `cr.commit()`**: el commit suelta el bloqueo de la
-fila. Con límite de tiempo configurado, la condición de antigüedad protege al job; sin
-límite (`0`) y con varios runners, otro runner podría ejecutarlo dos veces.
+La detección no depende de `limit_time_real_cron` ni del modo del servidor: funciona igual
+en Odoo.sh, en servidores propios con o sin límite de tiempo y en modo de hilos.
+
+### Funciones que hacen `cr.commit()`
+
+Se permite sin configuración. La función corre en el cursor del runner, que es propio del
+cron y está aislado de las peticiones de usuarios:
+
+- Lo que la función confirmó persiste aunque después falle; lo no confirmado se revierte.
+- El bloqueo de vida está en otra conexión, así que el commit no lo suelta: el job no se
+  confunde con un huérfano ni se ejecuta dos veces.
+
+Útil para procesos largos que guardan avance, o que llaman a funciones estándar que
+confirman por su cuenta. La función `on_fail` es la excepción: no debe hacer commit.
 
 ### Flujo interno de `_gq_process()`
 
 ```
+_gq_alive_lock()           → bloqueo consultivo en otra conexión: el job está vivo
 _gq_set_started()          → state = 'started', date_started = now(), retry_count + 1
-commit + bloqueo de fila   → 'started' visible; si el worker muere, el job es huérfano
+commit                     → 'started' visible; si el worker muere, el job es huérfano
     │
-    ├── savepoint
+    ├── _gq_guard()                        → ante un error, rollback de lo no confirmado
     │       ├── _gq_perform()              → ejecuta model.method(*args, **kwargs)
     │       │                                con usuario, sudo y contexto del encolado
     │       └── _gq_set_done()            → state = 'done'
@@ -568,6 +665,7 @@ commit + bloqueo de fila   → 'started' visible; si el worker muere, el job es 
     ├── GQNothingToDoJob                  → _gq_set_done(result=msg)
     ├── GQRetryableJobError               → _gq_postpone_pending() o _gq_set_failed()
     └── GQFailedJobError / Exception      → _gq_set_failed(exc_info=traceback)
+commit                     → resultado visible; se suelta el bloqueo consultivo
 ```
 
 ---
@@ -651,6 +749,44 @@ varios en la lista:
 - **Cancel**: cancela un job `waiting`, `pending` o `failed`. Un job `started` no se puede cancelar.
 - **Cancel Group**: cancela todos los jobs no ejecutados del grupo.
 
+### Requisitos del servidor
+
+Ninguno fuera de Odoo estándar: no hay proceso externo, ni `server_wide_modules`, ni
+peticiones HTTP a sí mismo. Solo deben estar activos los crons (`max_cron_threads > 0`).
+
+| Entorno | Funciona | Notas |
+|---|---|---|
+| Odoo.sh | Sí | El presupuesto se ajusta al límite de la plataforma. |
+| Servidor propio, multiproceso (`workers > 0`) | Sí | Con o sin `limit_time_real_cron`. |
+| Servidor propio, hilos (`workers = 0`) | Sí (probado) | Servidor real con 3 hilos de cron y 3 crons runner. |
+| Varios runners en paralelo | Sí (probado) | Procesos reales en paralelo: ningún job repetido, cadenas en orden. |
+| Varias instancias de Odoo sobre la misma BD | Sí (probado) | Procesos independientes sobre la misma BD; el bloqueo y la cola viven en PostgreSQL. |
+| Muerte del worker durante un job | Sí (probado) | Proceso matado a mitad del job: se recupera y se reintenta; tras agotar intentos queda `failed` (`GQDeadJobError`). |
+
+Cada runner en ejecución usa una conexión adicional a PostgreSQL (la del bloqueo de vida),
+solo mientras procesa un job.
+
+#### Pruebas realizadas
+
+- **Servidor Odoo real** (`workers = 0`, `max_cron_threads = 3`, 3 crons runner): 2505 jobs
+  (incluida una cadena de 5) terminados en 48 s, sin ejecuciones repetidas, cadena en orden,
+  los 3 crons procesaron jobs, `failure_count = 0` y sin errores en el log.
+- **Procesos en paralelo**: 3 runners más 1 que se suma tarde, 159 ejecuciones sin repetidos;
+  el grupo se detiene tras el fallo de un job.
+- **Muerte real del worker** (proceso terminado con `taskkill`): el job se recuperó como
+  huérfano, se reintentó a los 60 s y los datos confirmados antes de morir se conservaron; al
+  repetirse la muerte quedó `failed` y el resto de la cola siguió.
+
+#### Concurrencia entre runners
+
+Odoo usa aislamiento `REPEATABLE READ`: cuando dos runners tocan las mismas filas de la cola,
+PostgreSQL rechaza a uno con un error de serialización. No es un fallo: el runner revierte y
+reintenta (hasta 10 veces); si el conflicto persiste, deja el trabajo para otra pasada del cron.
+Estos conflictos no se registran como errores ni cuentan como fallo del cron.
+
+Encolar muchos jobs en una transacción crea un solo disparo inmediato por cron: cada disparo
+abre una conexión para avisar a los workers de cron al confirmar.
+
 ### Permisos
 
 - Encolar con `with_gq_delay()` no requiere permisos sobre `gq.job` (se crea con `sudo()`).
@@ -685,6 +821,10 @@ from odoo.addons.gq_queue.delay import GQDelayable
 
 GQDelayable(recordset, priority=10, eta=None, description=None, max_retries=5,
             identity_key=None, chunk_size=None, group=None, depends_on=None)
+
+# Llamada diferida y grafos
+GQDeferred(recordset, **opciones)      # lo que retorna gq_delayable()
+gq_chain(*nodos)  /  gq_group(*nodos)  # nodos: GQDeferred, cadenas o grupos
 ```
 
 Al llamar cualquier función sobre el proxy, crea y retorna el `gq.job` (varios con `chunk_size`):
@@ -716,7 +856,5 @@ raise GQNothingToDoJob("mensaje")
 
 | Limitación | Detalle |
 |---|---|
-| **Sin cadenas declarativas** | No hay `chain()` ni `group()` como en `queue_job`; el orden se arma con `depends_on`. |
 | **Sin canales** | No hay canales ni control de capacidad como en `queue_job`. El paralelismo lo da el número de crons runner. |
 | **Job más largo que el margen** | Un job que dura más que la mitad del límite de tiempo del servidor puede ser interrumpido. Se reintenta como huérfano hasta agotar intentos. Dividirlo en jobs más chicos. |
-| **Sin `cr.commit()` en jobs** | El commit dentro de la función encolada suelta el bloqueo de la fila (ver sección 10, *Jobs huérfanos*). |

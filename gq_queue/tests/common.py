@@ -4,6 +4,8 @@ from unittest.mock import patch
 from odoo import fields
 from odoo.tests import TransactionCase, new_test_user
 
+from ..models.gq_job import GQ_LOCK_NAMESPACE
+
 
 class GQCommon(TransactionCase):
     """Base de los tests de gq_queue: usuario, partner y funciones de prueba."""
@@ -23,6 +25,7 @@ class GQCommon(TransactionCase):
         self.fail_ids = set()
         self.fail_calls = []
         self.on_fail_error = None
+        self.during = None
         test = self
 
         def gq_on_fail(records, **kwargs):
@@ -39,12 +42,16 @@ class GQCommon(TransactionCase):
                     "ids": records.ids,
                     "args": args,
                     "kwargs": kwargs,
+                    "cr": records.env.cr,
                 }
             )
+            if test.during:
+                test.during(records)
             if test.side_effect:
                 raise test.side_effect
             if test.fail_ids & set(records.ids):
                 raise ValueError("lote con error")
+            return records.ids
 
         partner_cls = type(self.env["res.partner"])
         functions = {
@@ -66,6 +73,33 @@ class GQCommon(TransactionCase):
                 method=method,
             )
         )
+
+    def _hold_alive_lock(self, job):
+        """Simula, desde otra conexion, un runner vivo que ejecuta ``job``.
+
+        :returns: el cursor que mantiene el bloqueo; cerrarlo lo suelta.
+        """
+        cr = self.registry.cursor()
+        self.addCleanup(lambda: cr.closed or cr.close())
+        cr.execute(
+            "SELECT pg_try_advisory_xact_lock(%s, %s)", (GQ_LOCK_NAMESPACE, job.id)
+        )
+        self.assertTrue(cr.fetchone()[0])
+        return cr
+
+    def _alive_lock_is_free(self, job):
+        """True si ninguna sesion mantiene el bloqueo de vida de ``job``."""
+        self.env.cr.execute(
+            """
+            SELECT CASE
+                WHEN pg_try_advisory_lock(%(ns)s, %(id)s)
+                THEN pg_advisory_unlock(%(ns)s, %(id)s)
+                ELSE false
+            END
+            """,
+            {"ns": GQ_LOCK_NAMESPACE, "id": job.id},
+        )
+        return self.env.cr.fetchone()[0]
 
     def _run(self):
         self.Job._gq_job_runner(commit=False)

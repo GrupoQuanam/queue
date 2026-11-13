@@ -137,9 +137,9 @@ class TestGQJob(GQCommon):
         exhausted = self._make_started(minutes_ago=5, attempts=6)
         unlimited = self._make_started(minutes_ago=5, attempts=5, max_retries=0)
         unlimited_dead = self._make_started(minutes_ago=5, attempts=6, max_retries=0)
-        alive = self._make_started(minutes_ago=0, attempts=1)
-        with patch.object(type(self.Job), "_gq_time_limit", lambda self: 120):
-            self.Job._gq_recover_started_jobs()
+        alive = self._make_started(minutes_ago=5, attempts=1)
+        lock_cr = self._hold_alive_lock(alive)
+        self.Job._gq_recover_started_jobs()
         self.assertEqual(retry.state, "pending")
         self.assertEqual(retry.retry_count, 1)
         self.assertEqual(exhausted.state, "failed")
@@ -147,18 +147,25 @@ class TestGQJob(GQCommon):
         self.assertEqual(unlimited.state, "pending")
         self.assertEqual(unlimited_dead.state, "failed")
         self.assertEqual(
-            alive.state, "started", "Un job mas nuevo que el limite puede seguir vivo"
+            alive.state, "started", "Un job con su bloqueo de vida tomado sigue vivo"
         )
+        # El worker muere: PostgreSQL suelta el bloqueo al cerrarse la conexion
+        lock_cr.close()
+        self.Job._gq_recover_started_jobs()
+        self.assertEqual(alive.state, "pending")
 
-    def test_recover_schedules_check_for_recent_started(self):
-        self._make_started(minutes_ago=0, attempts=1)
+    def test_recovered_orphan_waits_before_retry(self):
+        """Un huerfano no se reintenta de inmediato: si mato a su worker, no
+        debe hacerlo varias veces seguidas."""
+        job = self._make_started(minutes_ago=5, attempts=1)
         triggers = self.env["ir.cron.trigger"]
         before = triggers.search([])
-        with patch.object(type(self.Job), "_gq_time_limit", lambda self: 120):
-            self.Job._gq_recover_started_jobs()
+        self._run()
+        self.assertEqual(job.state, "pending")
+        self.assertFalse(self.calls)
+        self.assertGreater(job.eta, fields.Datetime.now())
         new = triggers.search([]) - before
-        self.assertTrue(new)
-        self.assertGreater(new[0].call_at, fields.Datetime.now())
+        self.assertEqual(new.mapped("call_at"), [job.eta])
 
     # ── Presupuesto de tiempo ─────────────────────────────────────────────────
 
@@ -340,8 +347,7 @@ class TestGQJob(GQCommon):
                 "retry_count": 6,
             }
         )
-        with patch.object(type(self.Job), "_gq_time_limit", lambda self: 120):
-            self.Job._gq_recover_started_jobs()
+        self.Job._gq_recover_started_jobs()
         self.assertEqual((a.state, b.state), ("failed", "waiting"))
 
     def test_requeue_waiting_job_is_rejected(self):

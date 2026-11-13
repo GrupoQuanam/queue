@@ -2,7 +2,9 @@ from datetime import date, datetime
 from unittest.mock import patch
 
 from psycopg2 import OperationalError
+from psycopg2.errors import SerializationFailure
 
+from odoo import fields
 from odoo.tests import tagged
 
 from ..delay import GQDelayable
@@ -142,38 +144,166 @@ class TestGQJobEdge(GQCommon):
             "Primer commit antes de ejecutar, segundo al terminar",
         )
 
-    def test_job_taken_by_another_runner_is_skipped(self):
+    def test_job_function_can_commit(self):
+        """La funcion del job puede hacer commit en el cursor del runner."""
+        commits = []
+        self.during = lambda records: records.env.cr.commit()
+        job = self.partner.with_gq_delay().gq_probe()
+        with patch.object(self.env.cr, "commit", lambda: commits.append(job.state)):
+            self.Job._gq_job_runner()
+        self.assertEqual(job.state, "done", job.exc_info)
+        self.assertEqual(
+            commits,
+            ["started", "started", "done"],
+            "Commit de 'started', commit de la funcion y commit final",
+        )
+
+    def test_failure_in_commit_mode_rolls_back(self):
+        """En corrida real, un fallo revierte lo que la funcion no confirmo."""
+        events = []
+        self.side_effect = ValueError("boom")
         job = self.partner.with_gq_delay().gq_probe()
         with (
-            patch.object(self.env.cr, "commit", lambda: None),
-            patch.object(type(self.Job), "_gq_lock_started", lambda self: False),
+            patch.object(self.env.cr, "commit", lambda: events.append("commit")),
+            patch.object(self.env.cr, "rollback", lambda: events.append("rollback")),
         ):
             job._gq_process(commit=True)
-        self.assertFalse(self.calls, "La funcion no se ejecuta sin el bloqueo")
-        self.assertEqual(job.state, "started")
+        self.assertEqual(job.state, "failed")
+        self.assertEqual(events, ["commit", "rollback", "commit"])
 
-    def test_lock_started(self):
+    # ── Conflictos entre runners ──────────────────────────────────────────────
+
+    def _fake_transactions(self):
+        """Corrida real sin confirmar de verdad: commit y rollback solo se cuentan."""
+        events = []
+        for name in ("commit", "rollback"):
+            patcher = patch.object(
+                self.env.cr, name, lambda name=name: events.append(name)
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return events
+
+    def _flaky(self, function_name, failures):
+        """Hace que una funcion de gq.job choque con otro runner ``failures`` veces."""
+        job_cls = type(self.Job)
+        real = getattr(job_cls, function_name)
+        calls = []
+
+        def flaky(records, *args, **kwargs):
+            calls.append(1)
+            if len(calls) <= failures:
+                raise SerializationFailure("could not serialize access")
+            return real(records, *args, **kwargs)
+
+        patcher = patch.object(job_cls, function_name, flaky)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return calls
+
+    def test_runner_retries_when_another_runner_takes_the_job(self):
+        events = self._fake_transactions()
+        self._flaky("_gq_acquire_one_job", failures=2)
         job = self.partner.with_gq_delay().gq_probe()
-        self.assertFalse(job._gq_lock_started(), "Solo bloquea jobs en 'started'")
-        job._gq_set_started()
-        self.env.flush_all()
-        self.assertTrue(job._gq_lock_started())
+        self.Job._gq_job_runner()
+        self.assertEqual(job.state, "done", job.exc_info)
+        self.assertEqual(events.count("rollback"), 2, "Un rollback por conflicto")
 
-    # ── Huerfanos ─────────────────────────────────────────────────────────────
+    def test_conflict_is_not_retried_without_commit(self):
+        """Sin commit no se puede revertir sin perder trabajo: el error sube."""
+        self._flaky("_gq_acquire_one_job", failures=1)
+        self.partner.with_gq_delay().gq_probe()
+        with self.assertRaises(SerializationFailure):
+            self._run()
 
-    def test_no_orphan_check_scheduled_in_the_past(self):
-        self._make_started(minutes_ago=5, attempts=1)
-        triggers = self.env["ir.cron.trigger"]
-        before = triggers.search_count([])
-        self.Job._gq_schedule_orphan_check(grace=1)
-        self.assertEqual(triggers.search_count([]), before)
+    def test_runner_leaves_work_to_next_run_after_many_conflicts(self):
+        self._fake_transactions()
+        self._flaky("_gq_acquire_one_job", failures=1000)
+        job = self.partner.with_gq_delay().gq_probe()
+        with patch.object(type(self.Job), "_gq_cron_trigger") as trigger:
+            self.Job._gq_job_runner()
+        self.assertEqual(job.state, "pending")
+        self.assertFalse(self.calls)
+        trigger.assert_called_once_with()
 
-    def test_no_orphan_check_without_started_jobs(self):
-        self.Job.search([("state", "=", "started")]).write({"state": "done"})
-        triggers = self.env["ir.cron.trigger"]
-        before = triggers.search_count([])
-        self.Job._gq_schedule_orphan_check(grace=120)
-        self.assertEqual(triggers.search_count([]), before)
+    def test_job_outcome_retried_on_conflict(self):
+        events = self._fake_transactions()
+        self._flaky("_gq_stop_group", failures=1)
+        self.side_effect = ValueError("boom")
+        job = self.partner.with_gq_delay(group="g").gq_probe()
+        job._gq_process(commit=True)
+        self.assertEqual(job.state, "failed")
+        self.assertEqual(job.exc_name, "ValueError")
+        self.assertEqual(events.count("rollback"), 2, "Fallo del job y conflicto")
+
+    def test_job_outcome_not_applied_after_many_conflicts(self):
+        self._fake_transactions()
+        self._flaky("_gq_stop_group", failures=1000)
+        self.side_effect = ValueError("boom")
+        job = self.partner.with_gq_delay(group="g").gq_probe()
+        with self.assertLogs("odoo.addons.gq_queue.models.gq_job", "WARNING") as logs:
+            job._gq_process(commit=True)
+        self.assertTrue(
+            any("no se pudo registrar su resultado" in line for line in logs.output)
+        )
+
+    # ── Disparo del cron ──────────────────────────────────────────────────────
+
+    def _immediate_triggers(self):
+        cron = self.env.ref("gq_queue.gq_job_cron")
+        return self.env["ir.cron.trigger"].search(
+            [("cron_id", "=", cron.id), ("call_at", "<=", fields.Datetime.now())]
+        )
+
+    def test_one_immediate_trigger_per_transaction(self):
+        before = self._immediate_triggers()
+        for index in range(5):
+            self.partner.with_gq_delay().gq_probe(index)
+        self.assertEqual(
+            len(self._immediate_triggers() - before),
+            1,
+            "Encolar varios jobs no repite el disparo inmediato",
+        )
+
+    def test_trigger_recreated_after_savepoint_rollback(self):
+        before = self._immediate_triggers()
+        with self.assertRaises(ZeroDivisionError), self.env.cr.savepoint():
+            self.partner.with_gq_delay().gq_probe("revertido")
+            self.assertEqual(len(self._immediate_triggers() - before), 1)
+            1 / 0  # noqa: B018
+        self.assertFalse(self._immediate_triggers() - before, "El disparo se revirtio")
+        self.partner.with_gq_delay().gq_probe("ok")
+        self.assertEqual(len(self._immediate_triggers() - before), 1)
+
+    # ── Bloqueo de vida ───────────────────────────────────────────────────────
+
+    def test_alive_lock_held_while_running(self):
+        seen = []
+        job = self.partner.with_gq_delay().gq_probe()
+        self.assertTrue(self._alive_lock_is_free(job))
+        self.during = lambda records: seen.append(self._alive_lock_is_free(job))
+        self._run()
+        self.assertEqual(seen, [False], "Durante la ejecucion el job esta marcado vivo")
+        self.assertTrue(self._alive_lock_is_free(job), "Al terminar se libera")
+
+    def test_alive_lock_released_on_failure(self):
+        self.side_effect = ValueError("boom")
+        job = self.partner.with_gq_delay().gq_probe()
+        self._run()
+        self.assertEqual(job.state, "failed")
+        self.assertTrue(self._alive_lock_is_free(job))
+
+    def test_job_in_use_by_another_session_is_postponed(self):
+        job = self.partner.with_gq_delay().gq_probe()
+        other = self.partner.with_gq_delay()._gq_probe()
+        self._hold_alive_lock(job)
+        with self.assertLogs("odoo.addons.gq_queue.models.gq_job", "WARNING"):
+            self._run()
+        self.assertEqual(len(self.calls), 1, "Solo se ejecuto el otro job")
+        self.assertEqual(other.state, "done")
+        self.assertEqual(job.state, "pending")
+        self.assertEqual(job.retry_count, 0, "No se cuenta el intento")
+        self.assertGreater(job.eta, fields.Datetime.now())
 
     # ── Grupo ─────────────────────────────────────────────────────────────────
 

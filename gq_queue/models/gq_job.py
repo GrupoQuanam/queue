@@ -3,11 +3,13 @@ import logging
 import os
 import random
 import traceback
+import zlib
+from contextlib import contextmanager
 from datetime import timedelta
 from functools import partial
-from io import StringIO
 
 from psycopg2 import OperationalError
+from psycopg2.extensions import TransactionRollbackError
 
 from odoo import _, api, fields, models
 from odoo.exceptions import UserError
@@ -28,6 +30,13 @@ RETRY_INTERVAL = 5
 DEFAULT_RUNNER_SECONDS = 600
 # Intentos permitidos a un job con max_retries = 0 cuyo worker muere al ejecutarlo
 ORPHAN_MAX_ATTEMPTS = 5
+# Segundos que espera un job huerfano antes de reintentarse: evita que un job
+# que mata a su worker lo haga varias veces seguidas
+ORPHAN_RETRY_SECONDS = 60
+# Espacio de claves de los bloqueos consultivos de PostgreSQL de este modulo
+GQ_LOCK_NAMESPACE = zlib.crc32(b"gq.job") & 0x7FFFFFFF
+# Reintentos de una operacion de la cola ante un conflicto con otro runner
+CONFLICT_RETRIES = 10
 # Dias que se conservan los jobs terminados (parametro gq_queue.keep_done_days)
 DEFAULT_KEEP_DONE_DAYS = 30
 
@@ -214,6 +223,13 @@ class GQJob(models.Model):
         readonly=True,
         index=True,
     )
+    date_enqueued = fields.Datetime(
+        string="Enqueued At",
+        readonly=True,
+        help="Ultima vez que el job paso a 'pending', listo para que un runner "
+        "lo tome: al crearse, al liberarse de 'waiting' o al volver a la cola "
+        "para un reintento.",
+    )
     date_started = fields.Datetime(string="Started At", readonly=True)
     date_done = fields.Datetime(string="Finished At", readonly=True)
     date_cancelled = fields.Datetime(string="Cancelled At", readonly=True)
@@ -338,6 +354,7 @@ class GQJob(models.Model):
                 "exc_info": False,
                 "exec_time": 0,
                 "worker_pid": 0,
+                "date_enqueued": False,
                 "date_started": False,
                 "date_done": False,
                 "date_cancelled": False,
@@ -407,6 +424,7 @@ class GQJob(models.Model):
             RETURNING id
             """,
             ("Grupo detenido: fallo el job %s" % self.ids, groups),
+            log_exceptions=False,
         )
         rows = self.env.cr.fetchall()
         if rows:
@@ -434,7 +452,7 @@ class GQJob(models.Model):
         self.env.cr.execute(
             """
             UPDATE gq_job
-            SET state = 'pending'
+            SET state = 'pending', date_enqueued = (now() AT TIME ZONE 'UTC')
             WHERE id IN (
                 SELECT j.id FROM gq_job j
                 WHERE j.state = 'waiting'
@@ -454,11 +472,12 @@ class GQJob(models.Model):
                 FOR NO KEY UPDATE OF j SKIP LOCKED
             )
             RETURNING id
-            """
+            """,
+            log_exceptions=False,
         )
         released = self.browse([row[0] for row in self.env.cr.fetchall()])
         if released:
-            self.invalidate_model(["state"])
+            self.invalidate_model(["state", "date_enqueued"])
             released._gq_ensure_cron_trigger(immediate=not from_runner)
         return released
 
@@ -549,88 +568,163 @@ class GQJob(models.Model):
                     function_name,
                 )
 
-    def _gq_process(self, commit=False):
-        """Ejecuta el job y gestiona todos los casos de error."""
+    @contextmanager
+    def _gq_alive_lock(self):
+        """Marca el job como vivo mientras dura el bloque.
+
+        Toma un bloqueo consultivo de PostgreSQL en una conexion aparte. El
+        bloqueo no depende de la transaccion del runner, asi que la funcion del
+        job puede hacer commit sin perderlo, y PostgreSQL lo suelta solo si el
+        worker muere. Es lo que distingue un job en ejecucion de uno huerfano.
+
+        El bloqueo es de transaccion (no de sesion): se suelta solo al cerrar
+        la conexion aparte, sin depender de un desbloqueo explicito.
+
+        :returns: False si otra sesion viva ya tiene el job.
+        """
         self.ensure_one()
+        with self.env.registry.cursor() as lock_cr:
+            lock_cr.execute(
+                "SELECT pg_try_advisory_xact_lock(%s, %s)",
+                (GQ_LOCK_NAMESPACE, self.id),
+            )
+            yield lock_cr.fetchone()[0]
+
+    @contextmanager
+    def _gq_guard(self, commit):
+        """Revierte lo que el bloque dejo sin confirmar si termina con error.
+
+        En una corrida real (``commit=True``) el estado 'started' ya esta
+        confirmado, asi que basta un rollback: vuelve a ese punto o al ultimo
+        commit que haya hecho la funcion del job. Sin commit se usa un
+        savepoint, que no admite commits dentro del bloque.
+        """
+        if not commit:
+            with self.env.cr.savepoint():
+                yield
+            return
+        try:
+            yield
+        except Exception:
+            self.env.cr.rollback()
+            raise
+
+    def _gq_process(self, commit=False):
+        """Ejecuta el job y gestiona todos los casos de error.
+
+        :param commit: confirmar el estado 'started' antes de ejecutar y el
+            resultado al terminar. Es el modo del runner; permite que la
+            funcion del job haga ``cr.commit()``.
+        """
+        self.ensure_one()
+        with self._gq_alive_lock() as alive:
+            if alive:
+                self._gq_run(commit)
+            else:
+                # No deberia ocurrir: el job esta pendiente pero otra sesion
+                # viva lo tiene. Se deja para mas tarde sin contar el intento.
+                _logger.warning("GQ Job #%s en uso por otra sesion, se pospone", self.id)
+                self._gq_postpone_pending(seconds=PG_RETRY)
+            if commit:
+                self.env.flush_all()
+                self.env.cr.commit()  # pylint: disable=invalid-commit
+        _logger.debug("GQ Job #%s finished with state: %s", self.id, self.state)
+
+    def _gq_retry_conflicts(self, function, commit):
+        """Ejecuta ``function`` y la reintenta si choca con otro runner.
+
+        Odoo trabaja con aislamiento REPEATABLE READ: cuando dos runners tocan
+        las mismas filas de la cola, PostgreSQL rechaza a uno con un error de
+        serializacion. No es un fallo: se revierte la transaccion (un rollback
+        da una vista nueva de los datos) y se reintenta.
+
+        Solo en corridas reales (``commit=True``), donde lo anterior ya esta
+        confirmado y el rollback no pierde nada.
+
+        :returns: ``(True, resultado)``, o ``(False, None)`` si el conflicto
+            persiste tras ``CONFLICT_RETRIES`` intentos.
+        """
+        for _attempt in range(CONFLICT_RETRIES):
+            try:
+                return True, function()
+            except TransactionRollbackError:
+                if not commit:
+                    raise
+                self.env.cr.rollback()
+        return False, None
+
+    def _gq_run(self, commit):
         self._gq_set_started()
         if commit:
             # Persistir 'started' y el intento antes de ejecutar: si el worker
             # muere, el job queda visible como huerfano con su intento contado.
             self.env.cr.commit()  # pylint: disable=invalid-commit
-            if not self._gq_lock_started():
-                _logger.info("GQ Job #%s tomado por otro runner, se omite", self.id)
-                return
         _logger.debug(
             "GQ Job #%s started: %s.%s", self.id, self.model_name, self.method_name
         )
 
+        # Desenlace a aplicar si la funcion no termino bien
+        outcome = None
         try:
             try:
-                with self.env.cr.savepoint():
+                with self._gq_guard(commit):
                     self._gq_perform()
                     self._gq_set_done()
+                    # Los errores de escritura pendientes deben saltar aqui
+                    self.env.flush_all()
 
             except OperationalError as err:
                 # Errores de concurrencia de PostgreSQL: reintentar automaticamente
                 if err.pgcode not in PG_CONCURRENCY_ERRORS_TO_RETRY:
                     raise
-                message = str(err.pgerror or err)
-                self._gq_postpone_pending(result=message, seconds=PG_RETRY, reset_retry=True)
-                _logger.debug("GQ Job #%s OperationalError, postponed %ss", self.id, PG_RETRY)
+                outcome = partial(
+                    self._gq_postpone_pending,
+                    result=str(err.pgerror or err),
+                    seconds=PG_RETRY,
+                    reset_retry=True,
+                )
+                _logger.debug(
+                    "GQ Job #%s OperationalError, postponed %ss", self.id, PG_RETRY
+                )
 
         except GQNothingToDoJob as err:
             msg = str(err) or _("Job interrupted: nothing to do.")
-            self._gq_set_done(result=msg)
+            outcome = partial(self._gq_set_done, result=msg)
 
         except GQRetryableJobError as err:
             ignore_retry = getattr(err, "ignore_retry", False)
             if ignore_retry or self._gq_can_retry():
                 seconds = self._gq_retry_seconds(err)
-                self._gq_postpone_pending(
-                    result=str(err), seconds=seconds, reset_retry=ignore_retry
+                outcome = partial(
+                    self._gq_postpone_pending,
+                    result=str(err),
+                    seconds=seconds,
+                    reset_retry=ignore_retry,
                 )
                 _logger.debug("GQ Job #%s postponed %ss (retryable)", self.id, seconds)
             else:
-                with StringIO() as buff:
-                    traceback.print_exc(file=buff)
-                    exc_text = buff.getvalue()
+                exc_text = traceback.format_exc()
                 _logger.error("GQ Job #%s max retries exceeded:\n%s", self.id, exc_text)
-                self._gq_set_failed(exc_info=exc_text, exc=err)
+                outcome = partial(self._gq_set_failed, exc_info=exc_text, exc=err)
 
         except (GQFailedJobError, Exception) as err:
-            with StringIO() as buff:
-                traceback.print_exc(file=buff)
-                exc_text = buff.getvalue()
+            exc_text = traceback.format_exc()
             _logger.error("GQ Job #%s failed:\n%s", self.id, exc_text)
-            self._gq_set_failed(exc_info=exc_text, exc=err)
+            outcome = partial(self._gq_set_failed, exc_info=exc_text, exc=err)
 
-        if commit:
-            self.env.flush_all()
-            self.env.cr.commit()  # pylint: disable=invalid-commit
-
-        _logger.debug("GQ Job #%s finished with state: %s", self.id, self.state)
+        if outcome:
+            applied, _result = self._gq_retry_conflicts(
+                lambda: (outcome(), self.env.flush_all()), commit
+            )
+            if not applied:
+                # El job queda en 'started' sin bloqueo de vida: el siguiente
+                # runner lo recupera como huerfano.
+                _logger.warning(
+                    "GQ Job #%s: no se pudo registrar su resultado por conflictos",
+                    self.id,
+                )
 
     # ── Runner principal ──────────────────────────────────────────────────────
-
-    def _gq_lock_started(self):
-        """Vuelve a bloquear la fila del job tras confirmar el estado 'started'.
-
-        El bloqueo dura hasta el commit final del job y es lo que distingue a un
-        job en ejecucion de uno huerfano.
-
-        :returns: False si otro runner tomo el job entre el commit y el bloqueo.
-        """
-        self.ensure_one()
-        self.env.cr.execute(
-            """
-            SELECT id
-            FROM gq_job
-            WHERE id = %s AND state = 'started'
-            FOR NO KEY UPDATE SKIP LOCKED
-            """,
-            (self.id,),
-        )
-        return bool(self.env.cr.fetchone())
 
     @api.model
     def _gq_time_limit(self):
@@ -645,26 +739,47 @@ class GQJob(models.Model):
 
     @api.model
     def _gq_recover_started_jobs(self):
-        """Resetea jobs huerfanos en estado 'started' tras la muerte de su worker.
+        """Recupera jobs huerfanos: en 'started' pero sin worker que los ejecute.
 
-        Un job es huerfano si esta en 'started', su fila no esta bloqueada por
-        ningun runner y ademas inicio hace mas tiempo que el limite del servidor.
-        La condicion de tiempo evita reencolar un job vivo cuya funcion hizo
-        commit (y por tanto solto el bloqueo de su fila).
+        Un job en ejecucion mantiene un bloqueo consultivo (``_gq_alive_lock``).
+        Si el bloqueo esta libre, su worker murio: PostgreSQL lo solto al
+        cerrarse la conexion. La comprobacion toma y suelta el bloqueo en la
+        misma consulta.
 
-        El intento ya se conto al iniciar el job: vuelve a 'pending' mientras le
-        queden intentos y si no pasa a 'failed'.
+        El intento ya se conto al iniciar el job: vuelve a 'pending' (tras una
+        espera) mientras le queden intentos y si no pasa a 'failed'.
         """
-        grace = self._gq_time_limit()
         self.env.flush_all()
         self.env.cr.execute(
             """
+            WITH started AS MATERIALIZED (
+                SELECT id FROM gq_job WHERE state = 'started'
+            ),
+            orphan AS MATERIALIZED (
+                SELECT id FROM started
+                WHERE CASE
+                    WHEN pg_try_advisory_lock(%(namespace)s, id)
+                    THEN pg_advisory_unlock(%(namespace)s, id)
+                    ELSE false
+                END
+            )
             UPDATE gq_job
             SET
                 state = CASE
                     WHEN retry_count > COALESCE(NULLIF(max_retries, 0), %(cap)s)
                     THEN 'failed'
                     ELSE 'pending'
+                END,
+                eta = CASE
+                    WHEN retry_count > COALESCE(NULLIF(max_retries, 0), %(cap)s)
+                    THEN eta
+                    ELSE (now() AT TIME ZONE 'UTC')
+                        + make_interval(secs => %(backoff)s)
+                END,
+                date_enqueued = CASE
+                    WHEN retry_count > COALESCE(NULLIF(max_retries, 0), %(cap)s)
+                    THEN date_enqueued
+                    ELSE (now() AT TIME ZONE 'UTC')
                 END,
                 exc_info = CASE
                     WHEN retry_count > COALESCE(NULLIF(max_retries, 0), %(cap)s)
@@ -678,59 +793,43 @@ class GQJob(models.Model):
                 END
             WHERE id IN (
                   SELECT id FROM gq_job
-                  WHERE state = 'started'
-                    AND (
-                        date_started IS NULL
-                        OR date_started <= (now() AT TIME ZONE 'UTC')
-                            - make_interval(secs => %(grace)s)
-                    )
+                  WHERE id IN (SELECT id FROM orphan) AND state = 'started'
                   FOR NO KEY UPDATE SKIP LOCKED
               )
-            RETURNING id, state
+            RETURNING id, state, eta
             """,
             {
+                "namespace": GQ_LOCK_NAMESPACE,
                 "cap": ORPHAN_MAX_ATTEMPTS,
-                "grace": grace,
+                "backoff": ORPHAN_RETRY_SECONDS,
                 "message": "Job encontrado muerto: su worker termino durante la "
                 "ejecucion y se agotaron los intentos",
             },
+            log_exceptions=False,
         )
         rows = self.env.cr.fetchall()
-        if rows:
-            ids = [r[0] for r in rows]
-            self.invalidate_model(["state", "exc_info", "date_done"])
-            dead = self.browse([r[0] for r in rows if r[1] == GQ_FAILED])
-            if dead:
-                dead.sudo().write(
-                    {
-                        "exc_name": "GQDeadJobError",
-                        "exc_message": "Worker terminated while running the job",
-                    }
-                )
-                dead._gq_stop_group()
-                dead._gq_call_on_fail()
-            _logger.warning(
-                "GQ Queue: %d job(s) huerfano(s) recuperado(s): %s", len(ids), ids
-            )
-        if grace:
-            self._gq_schedule_orphan_check(grace)
-
-    @api.model
-    def _gq_schedule_orphan_check(self, grace):
-        """Programa el runner para cuando el 'started' mas antiguo pueda ser huerfano.
-
-        Sin esto, un job cuyo worker murio esperaria al intervalo del cron.
-        """
-        self.env.flush_all()
-        self.env.cr.execute(
-            "SELECT min(date_started) FROM gq_job WHERE state = 'started'"
-        )
-        oldest = self.env.cr.fetchone()[0]
-        if not oldest:
+        if not rows:
             return
-        check_at = oldest + timedelta(seconds=grace + 1)
-        if check_at > fields.Datetime.now():
-            self._gq_cron_trigger(at=check_at)
+        ids = [r[0] for r in rows]
+        self.invalidate_model(
+            ["state", "eta", "exc_info", "date_done", "date_enqueued"]
+        )
+        _logger.warning(
+            "GQ Queue: %d job(s) huerfano(s) recuperado(s): %s", len(ids), ids
+        )
+        dead = self.browse([r[0] for r in rows if r[1] == GQ_FAILED])
+        if dead:
+            dead.sudo().write(
+                {
+                    "exc_name": "GQDeadJobError",
+                    "exc_message": "Worker terminated while running the job",
+                }
+            )
+            dead._gq_stop_group()
+            dead._gq_call_on_fail()
+        retry_at = {r[2] for r in rows if r[1] == GQ_PENDING}
+        if retry_at:
+            self._gq_cron_trigger(at=list(retry_at))
 
     @api.model
     def _gq_acquire_one_job(self):
@@ -750,7 +849,8 @@ class GQJob(models.Model):
               AND (eta IS NULL OR eta <= (now() AT TIME ZONE 'UTC'))
             ORDER BY priority ASC, date_created ASC, id ASC
             LIMIT 1 FOR NO KEY UPDATE SKIP LOCKED
-            """
+            """,
+            log_exceptions=False,
         )
         row = self.env.cr.fetchone()
         return self.browse(row and row[0])
@@ -773,26 +873,45 @@ class GQJob(models.Model):
             max_seconds = limit // 2 if limit else DEFAULT_RUNNER_SECONDS
         deadline = fields.Datetime.now() + timedelta(seconds=max_seconds)
         _logger.debug("GQ Job Runner started (deadline en %ds)", max_seconds)
-        self._gq_recover_started_jobs()
-        self._gq_release_waiting(from_runner=True)
-        job = self._gq_acquire_one_job()
+        self._gq_retry_conflicts(self._gq_recover_started_jobs, commit)
+        job = self._gq_next_job(commit)
         processed = 0
         while job:
             job._gq_process(commit=commit)
             processed += 1
-            # Registrar avance: un runner que muere tras procesar jobs no cuenta
-            # como fallo del cron. remaining=0 evita que el cron relance el
-            # runner dentro de la misma pasada, fuera del presupuesto de tiempo.
-            self.env["ir.cron"]._notify_progress(done=processed, remaining=0)
             if fields.Datetime.now() >= deadline:
                 _logger.info(
                     "GQ Runner: deadline alcanzado (%ds), re-disparando cron", max_seconds
                 )
                 self._gq_cron_trigger()
                 break
-            self._gq_release_waiting(from_runner=True)
-            job = self._gq_acquire_one_job()
+            job = self._gq_next_job(commit)
+            # Registrar avance: un runner que muere tras procesar jobs no cuenta
+            # como fallo del cron. remaining=0 evita que el cron relance el
+            # runner dentro de la misma pasada, fuera del presupuesto de tiempo.
+            self.env["ir.cron"]._notify_progress(done=processed, remaining=0)
+        self.env["ir.cron"]._notify_progress(done=processed, remaining=0)
         _logger.debug("GQ Job Runner finished (%d jobs processed)", processed)
+
+    @api.model
+    def _gq_next_job(self, commit):
+        """Libera los jobs en espera que ya pueden ejecutarse y toma el siguiente.
+
+        :returns: recordset gq.job bloqueado, o vacio si no hay pendientes. Si
+            los conflictos con otros runners persisten, se deja el trabajo a
+            otra pasada del cron.
+        """
+
+        def pick():
+            self._gq_release_waiting(from_runner=True)
+            return self._gq_acquire_one_job()
+
+        picked, job = self._gq_retry_conflicts(pick, commit)
+        if not picked:
+            _logger.info("GQ Runner: demasiados conflictos, re-disparando cron")
+            self._gq_cron_trigger()
+            return self.browse()
+        return job
 
     # ── Limpieza ──────────────────────────────────────────────────────────────
 
@@ -830,11 +949,27 @@ class GQJob(models.Model):
         """Dispara todos los crons marcados como gq_job_runner.
 
         Si hay multiples crons (para paralelismo), se disparan todos.
+
+        Un disparo inmediato se crea una sola vez por transaccion y cron: al
+        confirmar, cada disparo abre una conexion para avisar a los workers de
+        cron, y encolar muchos jobs en un bucle haria muy lento ese commit.
+
         :param at: datetime opcional; si se omite, dispara inmediatamente.
         """
         crons = self.env["ir.cron"].sudo().search([("gq_job_runner", "=", True)])
+        if at is not None:
+            for cron in crons:
+                cron._trigger(at=at)
+            return
+        # Disparos inmediatos ya creados en esta transaccion, por cron. El
+        # diccionario se vacia solo al confirmar o revertir la transaccion.
+        created = self.env.cr.precommit.data.setdefault("gq_queue.triggers", {})
+        Trigger = self.env["ir.cron.trigger"].sudo()
         for cron in crons:
-            cron._trigger(at=at)
+            # exists(): un savepoint revertido pudo llevarse el disparo
+            if Trigger.browse(created.get(cron.id)).exists():
+                continue
+            created[cron.id] = cron._trigger().id
 
     def _gq_ensure_cron_trigger(self, immediate=True):
         """Crea triggers de cron cuando hay jobs pendientes en este recordset.
@@ -860,11 +995,17 @@ class GQJob(models.Model):
 
     @api.model_create_multi
     def create(self, vals_list):
+        now = fields.Datetime.now()
+        for vals in vals_list:
+            if vals.get("state", GQ_PENDING) == GQ_PENDING:
+                vals.setdefault("date_enqueued", now)
         records = super().create(vals_list)
         records._gq_ensure_cron_trigger()
         return records
 
     def write(self, vals):
+        if vals.get("state") == GQ_PENDING and "date_enqueued" not in vals:
+            vals = dict(vals, date_enqueued=fields.Datetime.now())
         res = super().write(vals)
         if "state" in vals or "eta" in vals:
             self._gq_ensure_cron_trigger()

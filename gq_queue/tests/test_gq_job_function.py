@@ -165,8 +165,7 @@ class TestGQJobFunction(GQCommon):
     def test_on_fail_for_dead_job(self):
         self._configure(on_fail_method="gq_on_fail")
         job = self._make_started(minutes_ago=5, attempts=6)
-        with patch.object(type(self.Job), "_gq_time_limit", lambda self: 120):
-            self.Job._gq_recover_started_jobs()
+        self.Job._gq_recover_started_jobs()
         self.assertEqual(job.state, "failed")
         self.assertEqual(job.exc_name, "GQDeadJobError")
         self.assertEqual(self.fail_calls[0]["exc_name"], "GQDeadJobError")
@@ -174,8 +173,7 @@ class TestGQJobFunction(GQCommon):
     def test_recover_without_dead_jobs(self):
         self._configure(on_fail_method="gq_on_fail")
         job = self._make_started(minutes_ago=5, attempts=1)
-        with patch.object(type(self.Job), "_gq_time_limit", lambda self: 120):
-            self.Job._gq_recover_started_jobs()
+        self.Job._gq_recover_started_jobs()
         self.assertEqual(job.state, "pending")
         self.assertFalse(job.exc_name)
         self.assertFalse(self.fail_calls)
@@ -213,6 +211,44 @@ class TestGQJobFunction(GQCommon):
         self.assertFalse(job.exc_message)
         self.assertFalse(job.worker_pid)
         self.assertFalse(job.exec_time)
+
+    def test_date_enqueued(self):
+        old = fields.Datetime.now() - timedelta(days=1)
+        first = self.partner.with_gq_delay().gq_probe("first")
+        second = self.partner.with_gq_delay(depends_on=first).gq_probe("second")
+        self.assertTrue(first.date_enqueued, "Nace pendiente: ya esta en la cola")
+        self.assertFalse(second.date_enqueued, "En espera aun no esta en la cola")
+        self._run()
+        self.assertEqual(second.state, "done")
+        self.assertTrue(second.date_enqueued, "Al liberarse entra en la cola")
+        # Reintento: vuelve a la cola
+        self.side_effect = GQRetryableJobError("later", seconds=30)
+        retried = self.partner.with_gq_delay().gq_probe("retried")
+        retried.date_enqueued = old
+        self._run()
+        self.assertEqual(retried.state, "pending")
+        self.assertGreater(retried.date_enqueued, old)
+        # Reencolar: sale de la cola y vuelve a entrar al liberarse
+        self.side_effect = ValueError("boom")
+        retried.eta = False
+        retried.max_retries = 1
+        self._run()
+        self.assertEqual(retried.state, "failed")
+        retried.date_enqueued = old
+        retried.action_requeue()
+        self.assertEqual(retried.state, "pending")
+        self.assertGreater(retried.date_enqueued, old)
+
+    def test_date_enqueued_on_recovered_orphan(self):
+        old = fields.Datetime.now() - timedelta(days=1)
+        orphan = self._make_started(minutes_ago=5, attempts=1)
+        dead = self._make_started(minutes_ago=5, attempts=6)
+        (orphan | dead).date_enqueued = old
+        self.Job._gq_recover_started_jobs()
+        self.assertEqual(orphan.state, "pending")
+        self.assertGreater(orphan.date_enqueued, old)
+        self.assertEqual(dead.state, "failed")
+        self.assertEqual(dead.date_enqueued, old, "Un job muerto no vuelve a la cola")
 
     def test_cancel_sets_date_cancelled(self):
         job = self.partner.with_gq_delay().gq_probe()
@@ -255,10 +291,14 @@ class TestGQJobFunction(GQCommon):
         bad_partner = self._partners(1)
         bad = bad_partner.with_gq_delay().gq_probe()
         self.fail_ids = set(bad_partner.ids)
-        with patch.object(self.env.cr, "commit", self.env.flush_all):
+        with (
+            patch.object(self.env.cr, "commit", self.env.flush_all),
+            patch.object(self.env.cr, "rollback", self.env.flush_all),
+        ):
             cron.method_direct_trigger()
         self.assertEqual(ok.state, "done", ok.exc_info)
         self.assertEqual(bad.state, "failed")
+        self.assertEqual(bad.exc_name, "ValueError")
         self.assertEqual(len(self.fail_calls), 1)
         progress = self.env["ir.cron.progress"].search(
             [("cron_id", "=", cron.id)], order="id desc", limit=1

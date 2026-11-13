@@ -127,6 +127,7 @@
                         <page string="Dates">
                             <group>
                                 <field name="date_created"/>
+                                <field name="date_enqueued"/>
                                 <field name="date_started"/>
                                 <field name="date_done"/>
                                 <field name="date_cancelled"/>
